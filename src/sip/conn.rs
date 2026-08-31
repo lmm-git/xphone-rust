@@ -177,6 +177,7 @@ impl TlsConn {
         tls_config: &TlsConfig,
         timeout: Duration,
     ) -> io::Result<Self> {
+        tracing::trace!(server_addr = %server_addr, "TEST");
         let tcp = TcpStream::connect_timeout(&server_addr, timeout)?;
         let local = tcp.local_addr()?;
 
