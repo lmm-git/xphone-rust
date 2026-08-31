@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{trace, debug, info, warn};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -67,9 +67,14 @@ impl SipUA {
             return Err(Error::TlsConfigRequired);
         }
 
-        let server_addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
-            .parse()
+        let mut server_addrs_iter = format!("{}:{}", cfg.host, cfg.port)
+            .to_socket_addrs()
             .map_err(|e| Error::Other(format!("invalid server address: {}", e)))?;
+        let server_addr = server_addrs_iter
+            .next()
+            .ok_or_else(|| Error::Other(format!("server address not resolvable: {}", cfg.host)))?;
+
+        trace!(server_addr = %server_addr, "Resolved server address");
 
         // Parse outbound proxy URI to SocketAddr if configured.
         let outbound_proxy = cfg.outbound_proxy.as_ref().and_then(|uri| {
