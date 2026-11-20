@@ -12,6 +12,7 @@ use super::conn::{self, TlsConfig};
 use super::dialog::extract_uri;
 use super::message::Message;
 use super::transaction::{self, TransactionManager};
+use crate::config::DialCancellation;
 use crate::error::{Error, Result};
 
 /// Maximum number of 3xx redirect hops before giving up.
@@ -386,10 +387,28 @@ impl Client {
         extra_headers: Option<&HashMap<String, String>>,
         auth_override: Option<&Credentials>,
     ) -> Result<InviteResult> {
+        self.send_invite_cancellable(target_uri, sdp, timeout, extra_headers, auth_override, None)
+    }
+
+    pub(crate) fn send_invite_cancellable(
+        &self,
+        target_uri: &str,
+        sdp: &[u8],
+        timeout: Duration,
+        extra_headers: Option<&HashMap<String, String>>,
+        auth_override: Option<&Credentials>,
+        cancellation: Option<&DialCancellation>,
+    ) -> Result<InviteResult> {
         let mut current_target = target_uri.to_string();
         let mut redirects: u8 = 0;
 
         loop {
+            if let Some(cancellation) = cancellation {
+                if cancellation.is_cancelled() {
+                    return Err(Error::DialCancelled);
+                }
+                cancellation.set_ringing(false);
+            }
             if redirects > 0 {
                 info!(hop = redirects, target = %current_target, "SIP >>> following 3xx redirect");
             }
@@ -399,6 +418,7 @@ impl Client {
                 timeout,
                 extra_headers,
                 auth_override,
+                cancellation,
             )? {
                 ConsumeResult::Success(result) => return Ok(*result),
                 ConsumeResult::Redirect(new_target) => {
@@ -423,6 +443,7 @@ impl Client {
         timeout: Duration,
         extra_headers: Option<&HashMap<String, String>>,
         auth_override: Option<&Credentials>,
+        cancellation: Option<&DialCancellation>,
     ) -> Result<ConsumeResult> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
@@ -439,6 +460,11 @@ impl Client {
 
         let (resp, branch, invite) = if resp.status_code == 401 || resp.status_code == 407 {
             self.tm.remove_tx(&branch);
+            if cancellation.is_some_and(DialCancellation::is_cancelled) {
+                let ack = self.build_ack_non2xx(&req, &resp, &branch);
+                self.tm.send_raw(&ack.to_bytes(), dest)?;
+                return Err(Error::DialCancelled);
+            }
             let auth_hdr_name = if resp.status_code == 401 {
                 "WWW-Authenticate"
             } else {
@@ -481,7 +507,11 @@ impl Client {
             (resp, branch, req)
         };
 
-        self.consume_invite_responses(invite, resp, &branch, timeout)
+        let result = self.consume_invite_responses(invite, resp, &branch, timeout, cancellation);
+        if result.is_err() {
+            self.tm.remove_tx(&branch);
+        }
+        result
     }
 
     /// Consumes provisional responses and returns Success, Redirect, or error.
@@ -491,21 +521,45 @@ impl Client {
         first_resp: Message,
         branch: &str,
         timeout: Duration,
+        cancellation: Option<&DialCancellation>,
     ) -> Result<ConsumeResult> {
         let mut provisionals = Vec::new();
         let mut early_sdp = None;
         let mut resp = first_resp;
 
-        while (100..200).contains(&resp.status_code) {
-            debug!(status = resp.status_code, reason = %resp.reason, "SIP <<< provisional");
-            // Capture SDP from 183 Session Progress for early media.
-            if resp.status_code == 183 && !resp.body.is_empty() {
-                let sdp_str = String::from_utf8_lossy(&resp.body).to_string();
-                debug!(sdp_len = sdp_str.len(), "SIP <<< 183 early media SDP");
-                early_sdp = Some(sdp_str);
+        let mut cancel_sent = false;
+        while (100..200).contains(&resp.status_code) || resp.cseq().1 == "CANCEL" {
+            // INVITE and CANCEL use the same Via branch. The response to
+            // CANCEL must never be treated as an answer to the INVITE.
+            if resp.cseq().1 != "CANCEL" {
+                debug!(status = resp.status_code, reason = %resp.reason, "SIP <<< provisional");
+                if resp.status_code == 180 {
+                    if let Some(cancellation) = cancellation {
+                        cancellation.set_ringing(true);
+                    }
+                }
+                if resp.status_code == 183 && !resp.body.is_empty() {
+                    early_sdp = Some(String::from_utf8_lossy(&resp.body).into_owned());
+                }
+                provisionals.push((resp.status_code, resp.reason.clone()));
             }
-            provisionals.push((resp.status_code, resp.reason.clone()));
-            resp = self.tm.read_response(branch, timeout)?;
+            resp = match cancellation.filter(|_| !cancel_sent) {
+                Some(cancellation) => {
+                    match self
+                        .tm
+                        .read_response_or_cancel(branch, timeout, cancellation.signal())?
+                    {
+                        Some(response) => response,
+                        None => {
+                            let cancel = self.build_cancel(&invite);
+                            self.tm.send_raw(&cancel.to_bytes(), self.outbound_dest())?;
+                            cancel_sent = true;
+                            self.tm.read_response(branch, timeout)?
+                        }
+                    }
+                }
+                None => self.tm.read_response(branch, timeout)?,
+            };
         }
 
         if resp.status_code >= 200 && resp.status_code < 300 {
@@ -520,6 +574,10 @@ impl Client {
                 provisionals,
                 early_sdp,
             })))
+        } else if cancellation.is_some_and(DialCancellation::is_cancelled) {
+            let ack = self.build_ack_non2xx(&invite, &resp, branch);
+            self.tm.send_raw(&ack.to_bytes(), self.outbound_dest())?;
+            Err(Error::DialCancelled)
         } else if resp.status_code >= 300 && resp.status_code < 400 {
             // 3xx redirect — extract target from Contact header.
             // Send ACK for 3xx (required by RFC 3261 §17.1.1.3).
@@ -761,6 +819,18 @@ impl Client {
         }
 
         msg
+    }
+
+    fn build_cancel(&self, invite: &Message) -> Message {
+        let mut cancel = Message::new_request("CANCEL", &invite.request_uri);
+        for name in ["Via", "From", "To", "Call-ID", "Max-Forwards"] {
+            cancel.set_header(name, invite.header(name));
+        }
+        for route in invite.header_values("Route") {
+            cancel.add_header("Route", route);
+        }
+        cancel.set_header("CSeq", &format!("{} CANCEL", invite.cseq().0));
+        cancel
     }
 
     /// Builds an ACK for a 2xx response to INVITE.
@@ -1287,6 +1357,61 @@ mod tests {
 
         let result = client.send_register(Duration::from_secs(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_waits_for_provisional_and_acknowledges_invite_failure() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let client = Client::new(test_config(server.local_addr().unwrap().port())).unwrap();
+        let cancellation = DialCancellation::default();
+        let peer_cancellation = cancellation.clone();
+        let peer = std::thread::spawn(move || {
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let invite = super::super::message::parse(&data).unwrap();
+            assert_eq!(invite.method, "INVITE");
+
+            let respond = |request: &Message, code, reason| {
+                let mut response = Message::new_response(code, reason);
+                for name in ["Via", "From", "Call-ID", "CSeq"] {
+                    response.set_header(name, request.header(name));
+                }
+                response.set_header("To", &format!("{};tag=peer", request.header("To")));
+                server.send(&response.to_bytes(), from).unwrap();
+            };
+
+            peer_cancellation.cancel();
+            assert!(server.receive(Duration::from_millis(50)).is_err());
+            respond(&invite, 180, "Ringing");
+            let (data, cancel_source) = server.receive(Duration::from_secs(2)).unwrap();
+            let cancel = super::super::message::parse(&data).unwrap();
+            assert_eq!(cancel_source, from);
+            assert_eq!(cancel.method, "CANCEL");
+            assert_eq!(cancel.request_uri, invite.request_uri);
+            assert_eq!(cancel.cseq(), (invite.cseq().0, "CANCEL"));
+            for name in ["Via", "From", "To", "Call-ID"] {
+                assert_eq!(cancel.header(name), invite.header(name));
+            }
+            respond(&cancel, 200, "OK");
+            respond(&invite, 487, "Request Terminated");
+
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+            assert_eq!(ack.via_branch(), invite.via_branch());
+            assert_eq!(ack.cseq(), (invite.cseq().0, "ACK"));
+        });
+
+        let result = client.send_invite_cancellable(
+            "sip:1002@pbx.local",
+            b"",
+            Duration::from_secs(2),
+            None,
+            None,
+            Some(&cancellation),
+        );
+        assert!(matches!(result, Err(Error::DialCancelled)), "{result:?}");
+        peer.join().unwrap();
+        client.close();
     }
 
     #[test]

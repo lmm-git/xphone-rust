@@ -175,6 +175,17 @@ impl TransactionManager {
 
     /// Reads the next response for a transaction identified by its Via branch.
     pub fn read_response(&self, branch: &str, timeout: Duration) -> Result<Message> {
+        Ok(self
+            .read_response_or_cancel(branch, timeout, &crossbeam_channel::never())?
+            .expect("the never channel cannot cancel"))
+    }
+
+    pub(crate) fn read_response_or_cancel(
+        &self,
+        branch: &str,
+        timeout: Duration,
+        cancelled: &Receiver<()>,
+    ) -> Result<Option<Message>> {
         let resp_rx = {
             let inner = self.inner.lock();
             let tx = inner
@@ -184,14 +195,16 @@ impl TransactionManager {
             tx.resp_rx.clone()
         };
 
-        crossbeam_channel::select! {
+        let timeout = crossbeam_channel::after(timeout);
+        crossbeam_channel::select_biased! {
             recv(resp_rx) -> msg => {
-                msg.map_err(|_| Error::Other("sip: transaction manager stopped".into()))
+                msg.map(Some).map_err(|_| Error::Other("sip: transaction manager stopped".into()))
             }
             recv(self.done_rx) -> _ => {
                 Err(Error::Other("sip: transaction manager stopped".into()))
             }
-            default(timeout) => {
+            recv(cancelled) -> _ => Ok(None),
+            recv(timeout) -> _ => {
                 Err(Error::Other("sip: transaction timeout".into()))
             }
         }

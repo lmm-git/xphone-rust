@@ -16,6 +16,9 @@ pub enum Error {
     /// Outbound dial timed out before the remote party answered.
     #[error("xphone: dial timeout exceeded before answer")]
     DialTimeout,
+    /// The local user cancelled the outbound call before it became active.
+    #[error("xphone: outbound call cancelled")]
+    DialCancelled,
     /// All ports in the configured RTP port range are in use.
     #[error("xphone: RTP port range exhausted")]
     NoRtpPortAvailable,

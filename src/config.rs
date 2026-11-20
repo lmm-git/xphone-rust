@@ -1,4 +1,11 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
+
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use parking_lot::Mutex;
 
 use crate::sip::auth::Credentials;
 use crate::sip::conn::TlsConfig;
@@ -415,6 +422,53 @@ impl Default for PhoneBuilder {
     }
 }
 
+/// Controls one outgoing INVITE until it receives its final response.
+#[derive(Debug, Clone)]
+pub struct DialCancellation(Arc<DialCancellationState>);
+
+#[derive(Debug)]
+struct DialCancellationState {
+    signal: Mutex<Option<Sender<()>>>,
+    cancelled: Receiver<()>,
+    ringing: AtomicBool,
+}
+
+impl Default for DialCancellation {
+    fn default() -> Self {
+        let (signal, cancelled) = bounded(0);
+        Self(Arc::new(DialCancellationState {
+            signal: Mutex::new(Some(signal)),
+            cancelled,
+            ringing: AtomicBool::new(false),
+        }))
+    }
+}
+
+impl DialCancellation {
+    /// Requests cancellation of this outgoing call.
+    pub fn cancel(&self) {
+        self.0.signal.lock().take();
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.try_recv() == Err(TryRecvError::Disconnected)
+    }
+
+    /// Whether the peer has reported that it is ringing.
+    pub fn is_ringing(&self) -> bool {
+        self.0.ringing.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_ringing(&self, ringing: bool) {
+        self.0.ringing.store(ringing, Ordering::Release);
+    }
+
+    pub(crate) fn signal(&self) -> &Receiver<()> {
+        &self.0.cancelled
+    }
+}
+
 /// Configuration for an outbound call.
 ///
 /// Use [`DialOptionsBuilder`] for ergonomic construction with defaults.
@@ -454,6 +508,8 @@ pub struct DialOptions {
     /// conflated these scopes and tripped exactly this failure in
     /// Docker-bridge deployments — keeping the scope SDP-only avoids it.
     pub rtp_address: Option<String>,
+    /// Optional handle for ringing progress and local cancellation.
+    pub cancellation: Option<DialCancellation>,
 }
 
 impl Default for DialOptions {
@@ -468,6 +524,7 @@ impl Default for DialOptions {
             video: false,
             video_codecs: Vec::new(),
             rtp_address: None,
+            cancellation: None,
         }
     }
 }

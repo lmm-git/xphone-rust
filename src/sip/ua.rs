@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{trace, debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -483,12 +483,13 @@ impl SipTransport for SipUA {
 
         let auth_override = &opts.auth;
 
-        let result = self.client.send_invite(
+        let result = self.client.send_invite_cancellable(
             &target_uri,
             local_sdp,
             timeout,
             extra_ref,
             auth_override.as_ref(),
+            opts.cancellation.as_ref(),
         )?;
         let remote_sdp = String::from_utf8_lossy(&result.response.body).to_string();
         info!(
@@ -501,6 +502,17 @@ impl SipTransport for SipUA {
             result.invite,
             result.response,
         ));
+
+        // A final 2xx may cross CANCEL on the wire. The client has
+        // acknowledged it; end the established dialog immediately.
+        if opts
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::DialCancellation::is_cancelled)
+        {
+            dlg.send_bye()?;
+            return Err(Error::DialCancelled);
+        }
 
         Ok(crate::transport::DialResult {
             dialog: dlg as Arc<dyn Dialog>,
