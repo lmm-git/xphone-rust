@@ -263,6 +263,7 @@ struct CallInner {
 ///
 /// Created via [`Call::new_inbound`] or [`Call::new_outbound`] and returned as `Arc<Call>`.
 pub struct Call {
+    hold_change: Mutex<()>,
     inner: Mutex<CallInner>,
     pub(crate) dlg: Arc<dyn Dialog>,
 }
@@ -271,6 +272,7 @@ impl Call {
     /// Creates a new inbound call in the `Ringing` state.
     pub fn new_inbound(dlg: Arc<dyn Dialog>) -> Arc<Self> {
         Arc::new(Call {
+            hold_change: Mutex::new(()),
             inner: Mutex::new(CallInner {
                 id: new_call_id(),
                 state: CallState::Ringing,
@@ -325,6 +327,7 @@ impl Call {
     /// Creates a new outbound call in the `Dialing` state with the given dial options.
     pub fn new_outbound(dlg: Arc<dyn Dialog>, opts: DialOptions) -> Arc<Self> {
         Arc::new(Call {
+            hold_change: Mutex::new(()),
             inner: Mutex::new(CallInner {
                 id: new_call_id(),
                 state: CallState::Dialing,
@@ -840,27 +843,31 @@ impl Call {
 
     /// Places the call on hold by sending a re-INVITE with `sendonly` SDP.
     pub fn hold(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
-        if inner.state != CallState::Active {
-            return Err(Error::InvalidState);
-        }
-        inner.local_sdp = Self::build_local_sdp(&mut inner, sdp::DIR_SEND_ONLY);
-        let _ = self.dlg.send_reinvite(inner.local_sdp.as_bytes());
-        inner.state = CallState::OnHold;
-        Self::fire_on_state(&inner, CallState::OnHold);
-        Ok(())
+        self.update_hold(CallState::Active, CallState::OnHold, sdp::DIR_SEND_ONLY)
     }
 
     /// Resumes a held call by sending a re-INVITE with `sendrecv` SDP.
     pub fn resume(&self) -> Result<()> {
+        self.update_hold(CallState::OnHold, CallState::Active, sdp::DIR_SEND_RECV)
+    }
+
+    fn update_hold(&self, from: CallState, to: CallState, direction: &str) -> Result<()> {
+        let _change = self.hold_change.lock();
+        let offer = {
+            let mut inner = self.inner.lock();
+            if inner.state != from {
+                return Err(Error::InvalidState);
+            }
+            Self::build_local_sdp(&mut inner, direction)
+        };
+        self.dlg.send_reinvite(offer.as_bytes())?;
         let mut inner = self.inner.lock();
-        if inner.state != CallState::OnHold {
+        if inner.state != from {
             return Err(Error::InvalidState);
         }
-        inner.local_sdp = Self::build_local_sdp(&mut inner, sdp::DIR_SEND_RECV);
-        let _ = self.dlg.send_reinvite(inner.local_sdp.as_bytes());
-        inner.state = CallState::Active;
-        Self::fire_on_state(&inner, CallState::Active);
+        inner.local_sdp = offer;
+        inner.state = to;
+        Self::fire_on_state(&inner, to);
         Ok(())
     }
 
@@ -1219,55 +1226,41 @@ impl Call {
 
     /// Initiates a blind (unattended) transfer to the given SIP target URI.
     pub fn blind_transfer(self: &Arc<Self>, target: &str) -> Result<()> {
-        {
-            let inner = self.inner.lock();
-            if inner.state != CallState::Active && inner.state != CallState::OnHold {
-                return Err(Error::InvalidState);
-            }
+        self.blind_transfer_with_result(target, |_| {})
+    }
+
+    /// Initiates a blind transfer and reports the final SIP status from REFER NOTIFY.
+    ///
+    /// A successful NOTIFY ends the call. A failed NOTIFY leaves the call available.
+    pub fn blind_transfer_with_result(
+        self: &Arc<Self>,
+        target: &str,
+        on_result: impl FnOnce(u16) + Send + 'static,
+    ) -> Result<()> {
+        if !matches!(self.state(), CallState::Active | CallState::OnHold) {
+            return Err(Error::InvalidState);
         }
-        let weak = Arc::downgrade(self);
-        self.dlg.on_notify(Box::new(move |code| {
-            let reason = if (200..300).contains(&code) {
-                EndReason::Transfer
-            } else if code >= 300 {
-                EndReason::TransferFailed
-            } else {
-                // 1xx provisional — transfer in progress, don't end the call yet.
-                return;
-            };
-            let Some(call) = weak.upgrade() else {
-                return;
-            };
-            let mut inner = call.inner.lock();
-            if inner.state == CallState::Ended {
-                return;
-            }
-            inner.state = CallState::Ended;
-            Self::fire_on_state(&inner, CallState::Ended);
-            Self::fire_on_ended(&mut inner, reason);
-        }));
-        self.dlg.send_refer(target)?;
-        Ok(())
+        self.send_transfer(target, None, on_result)
     }
 
     /// Performs an attended transfer (REFER with Replaces).
-    ///
-    /// Sends a REFER on this call's dialog with `other`'s dialog identifiers
-    /// in the Replaces header (RFC 3891). On success (2xx NOTIFY), both calls
-    /// end with `EndReason::Transfer`. On failure (3xx+ NOTIFY), both calls
-    /// end with `EndReason::TransferFailed`.
-    ///
-    /// Works for any call regardless of whether it was created by `Phone` or `Server`.
     pub fn attended_transfer(self: &Arc<Self>, other: &Arc<Call>) -> Result<()> {
+        self.attended_transfer_with_result(other, |_| {})
+    }
+
+    /// Initiates an attended transfer and reports the final SIP status from REFER NOTIFY.
+    ///
+    /// A successful NOTIFY ends both calls. A failed NOTIFY leaves both available.
+    pub fn attended_transfer_with_result(
+        self: &Arc<Self>,
+        other: &Arc<Call>,
+        on_result: impl FnOnce(u16) + Send + 'static,
+    ) -> Result<()> {
+        if Arc::ptr_eq(self, other)
+            || !matches!(self.state(), CallState::Active | CallState::OnHold)
+            || !matches!(other.state(), CallState::Active | CallState::OnHold)
         {
-            let state_self = self.state();
-            if state_self != CallState::Active && state_self != CallState::OnHold {
-                return Err(Error::InvalidState);
-            }
-            let state_other = other.state();
-            if state_other != CallState::Active && state_other != CallState::OnHold {
-                return Err(Error::InvalidState);
-            }
+            return Err(Error::InvalidState);
         }
 
         // Extract other call's dialog identifiers for the Replaces header.
@@ -1306,28 +1299,47 @@ impl Call {
             uri_encode(&b_local_tag),
         );
 
-        // Wire up NOTIFY handler: on 2xx, end both calls with Transfer reason.
-        // On 3xx+, end both with TransferFailed. Ignore 1xx provisionals.
-        let weak_self = Arc::downgrade(self);
-        let weak_other = Arc::downgrade(other);
+        self.send_transfer(&refer_to, Some(other), on_result)
+    }
+
+    fn send_transfer(
+        self: &Arc<Self>,
+        target: &str,
+        other: Option<&Arc<Call>>,
+        on_result: impl FnOnce(u16) + Send + 'static,
+    ) -> Result<()> {
+        let pending = Arc::new(Mutex::new(Some(on_result)));
+        let callback = pending.clone();
+        let original = Arc::downgrade(self);
+        let consultation = other.map(Arc::downgrade);
         self.dlg.on_notify(Box::new(move |code| {
-            let reason = if (200..300).contains(&code) {
-                EndReason::Transfer
-            } else if code >= 300 {
-                EndReason::TransferFailed
-            } else {
+            if code < 200 {
+                return;
+            }
+            let Some(on_result) = callback.lock().take() else {
                 return;
             };
-            if let Some(a) = weak_self.upgrade() {
-                a.end_with_reason(reason);
-            }
-            if let Some(b) = weak_other.upgrade() {
-                b.end_with_reason(reason);
-            }
+            let original = original.clone();
+            let consultation = consultation.clone();
+            // A BYE waits for a SIP response. Keep the SIP reader free to receive it.
+            spawn_callback(move || {
+                if (200..300).contains(&code) {
+                    if let Some(call) = original.upgrade() {
+                        call.end_with_reason(EndReason::Transfer);
+                    }
+                    if let Some(call) = consultation.and_then(|call| call.upgrade()) {
+                        call.end_with_reason(EndReason::Transfer);
+                    }
+                }
+                on_result(code);
+            });
         }));
-
-        self.dlg.send_refer(&refer_to)?;
-        Ok(())
+        let result = self.dlg.send_refer(target);
+        if result.is_err() && pending.lock().take().is_none() {
+            // A final NOTIFY can arrive before the REFER transaction completes.
+            return Ok(());
+        }
+        result
     }
 
     /// Ends the call with a specific reason. Sends BYE if active/on-hold.
@@ -1340,15 +1352,17 @@ impl Call {
         if let Some(ref cancel) = inner.session_timer_cancel {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        if inner.state == CallState::Active || inner.state == CallState::OnHold {
-            let _ = self.dlg.send_bye();
-        }
+        let send_bye = matches!(inner.state, CallState::Active | CallState::OnHold);
         inner.state = CallState::Ended;
         for s in &mut inner.media_streams {
             s.stop();
         }
         Self::fire_on_state(&inner, CallState::Ended);
         Self::fire_on_ended(&mut inner, reason);
+        drop(inner);
+        if send_bye {
+            let _ = self.dlg.send_bye();
+        }
     }
 
     // --- Simulation methods (for tests and incoming SIP events) ---
@@ -2604,20 +2618,22 @@ mod tests {
     }
 
     #[test]
-    fn blind_transfer_failure_notify_ends_call() {
+    fn failed_blind_transfer_leaves_the_call_active() {
         let dlg = mock_dlg();
         let call = Call::new_inbound(dlg.clone());
         call.accept().unwrap();
         let (tx, rx) = mpsc::channel();
-        call.on_ended(move |r| {
-            let _ = tx.send(r);
-        });
-        call.blind_transfer("sip:1003@pbx").unwrap();
-        dlg.simulate_notify(503); // Service Unavailable
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(200)).unwrap(),
-            EndReason::TransferFailed
-        );
+        call.blind_transfer_with_result("sip:1003@pbx", move |status| {
+            let _ = tx.send(status);
+        })
+        .unwrap();
+
+        dlg.simulate_notify(100);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        dlg.simulate_notify(503);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 503);
+        dlg.simulate_notify(200);
+        assert_eq!(call.state(), CallState::Active);
     }
 
     #[test]
@@ -2707,34 +2723,26 @@ mod tests {
     }
 
     #[test]
-    fn attended_transfer_failure_ends_both() {
+    fn failed_attended_transfer_leaves_both_calls_available() {
         let dlg_a = mock_dlg_with_tags("a", "<sip:1001@pbx>;tag=a1", "<sip:bob@pbx>;tag=b1");
         let dlg_b = mock_dlg_with_tags("b", "<sip:1001@pbx>;tag=a2", "<sip:charlie@pbx>;tag=c2");
         let call_a = Call::new_inbound(dlg_a.clone());
         call_a.accept().unwrap();
-        let call_b = Call::new_outbound(dlg_b.clone(), DialOptions::default());
+        call_a.hold().unwrap();
+        let call_b = Call::new_outbound(dlg_b, DialOptions::default());
         call_b.simulate_response(200, "OK");
+        let (tx, rx) = mpsc::channel();
+        call_a
+            .attended_transfer_with_result(&call_b, move |status| {
+                let _ = tx.send(status);
+            })
+            .unwrap();
 
-        let (tx_a, rx_a) = mpsc::channel();
-        let (tx_b, rx_b) = mpsc::channel();
-        call_a.on_ended(move |r| {
-            let _ = tx_a.send(r);
-        });
-        call_b.on_ended(move |r| {
-            let _ = tx_b.send(r);
-        });
-
-        call_a.attended_transfer(&call_b).unwrap();
-        dlg_a.simulate_notify(503);
-
-        assert_eq!(
-            rx_a.recv_timeout(Duration::from_millis(200)).unwrap(),
-            EndReason::TransferFailed
-        );
-        assert_eq!(
-            rx_b.recv_timeout(Duration::from_millis(200)).unwrap(),
-            EndReason::TransferFailed
-        );
+        dlg_a.simulate_notify(486);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), 486);
+        assert_eq!(call_a.state(), CallState::OnHold);
+        assert_eq!(call_b.state(), CallState::Active);
+        call_a.resume().unwrap();
     }
 
     #[test]

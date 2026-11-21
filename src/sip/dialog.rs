@@ -164,15 +164,24 @@ impl Dialog for SipDialogUAC {
         let mut req = self.build_request("INVITE");
         req.set_header("Content-Type", "application/sdp");
         req.body = sdp.to_vec();
-        let _ = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
+        let response = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(Error::Other(format!(
+                "re-INVITE rejected: {}",
+                response.status_code
+            )));
+        }
         Ok(())
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
         let refer_to = normalize_sip_uri(target, self.client.domain());
         let mut req = self.build_request("REFER");
-        req.set_header("Refer-To", &refer_to);
-        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        req.set_header("Refer-To", &format!("<{refer_to}>"));
+        let response = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(Error::TransferFailed);
+        }
         Ok(())
     }
 
@@ -383,15 +392,24 @@ impl Dialog for SipDialogUAS {
         let mut req = self.build_request("INVITE");
         req.set_header("Content-Type", "application/sdp");
         req.body = sdp.to_vec();
-        let _ = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
+        let response = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(Error::Other(format!(
+                "re-INVITE rejected: {}",
+                response.status_code
+            )));
+        }
         Ok(())
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
         let refer_to = normalize_sip_uri(target, self.client.domain());
         let mut req = self.build_request("REFER");
-        req.set_header("Refer-To", &refer_to);
-        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        req.set_header("Refer-To", &format!("<{refer_to}>"));
+        let response = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(Error::TransferFailed);
+        }
         Ok(())
     }
 

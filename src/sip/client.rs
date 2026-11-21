@@ -730,10 +730,17 @@ impl Client {
             return Err(Error::Other("sip: client closed".into()));
         }
         debug!(method = %req.method, "SIP >>> in-dialog request");
-        let resp = self.tm.send(req, self.outbound_dest(), timeout)?;
+        let mut result = self.tm.send(req, self.outbound_dest(), timeout);
+        let branch = req.via_branch();
+        while result
+            .as_ref()
+            .is_ok_and(|response| (100..200).contains(&response.status_code))
+        {
+            result = self.tm.read_response(branch, timeout);
+        }
+        self.tm.remove_tx(branch);
+        let resp = result?;
         debug!(method = %req.method, status = resp.status_code, reason = %resp.reason, "SIP <<< in-dialog response");
-        let branch = req.via_branch().to_string();
-        self.tm.remove_tx(&branch);
         Ok(resp)
     }
 
