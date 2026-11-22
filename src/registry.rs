@@ -1,7 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use crossbeam_channel::{self as channel, Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
@@ -17,7 +15,10 @@ struct Inner {
     on_registered: Vec<Arc<dyn Fn() + Send + Sync>>,
     on_unregistered: Vec<Arc<dyn Fn() + Send + Sync>>,
     on_error: Vec<Arc<dyn Fn(Error) + Send + Sync>>,
+    reregistering: bool,
     stopped: bool,
+    /// Handle for the re-registration thread spawned by handle_drop.
+    rereg_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Manages SIP registration lifecycle: initial register with retries,
@@ -42,7 +43,9 @@ impl Registry {
                 on_registered: Vec::new(),
                 on_unregistered: Vec::new(),
                 on_error: Vec::new(),
+                reregistering: false,
                 stopped: false,
+                rereg_thread: None,
             })),
             stop_tx: Mutex::new(None),
             loop_thread: Mutex::new(None),
@@ -61,11 +64,12 @@ impl Registry {
         }
         *self.stop_tx.lock() = Some(stop_tx);
 
-        // Coalesce transport drops and handle them on the refresh thread so
-        // only one REGISTER sequence can run at a time.
-        let (drop_tx, drop_rx) = crossbeam_channel::bounded(1);
+        // Wire up transport drop detection.
+        let inner_clone = Arc::clone(&self.inner);
+        let tr_clone = Arc::clone(&self.tr);
+        let cfg_clone = self.cfg.clone();
         self.tr.on_drop(Box::new(move || {
-            let _ = drop_tx.try_send(());
+            handle_drop(&inner_clone, &tr_clone, &cfg_clone);
         }));
 
         // Attempt initial registration with retries.
@@ -80,7 +84,7 @@ impl Registry {
         let inner = Arc::clone(&self.inner);
         let handle = std::thread::Builder::new()
             .name("registry-loop".into())
-            .spawn(move || registry_loop(tr, cfg, inner, stop_rx, drop_rx))
+            .spawn(move || registry_loop(tr, cfg, inner, stop_rx))
             .expect("failed to spawn registry loop");
         *self.loop_thread.lock() = Some(handle);
 
@@ -89,24 +93,33 @@ impl Registry {
 
     /// Stops the background loop, sends unregister, and transitions to Disconnected.
     pub fn stop(&self) {
-        self.inner.lock().stopped = true;
-        // Close the stop channel before joining to interrupt retry delays.
+        // Send REGISTER Expires=0 to unregister before tearing down.
+        {
+            let inner = self.inner.lock();
+            if inner.state == PhoneState::Registered {
+                drop(inner);
+                info!("unregistering from server");
+                if let Err(e) = self.tr.unregister(Duration::from_secs(5)) {
+                    warn!(error = %e, "unregister failed");
+                }
+            }
+        }
+
+        let rereg_handle = {
+            let mut inner = self.inner.lock();
+            inner.state = PhoneState::Disconnected;
+            inner.stopped = true;
+            inner.rereg_thread.take()
+        };
+        // Drop the sender to close the channel — wakes the loop.
         self.stop_tx.lock().take();
+        // Join the background loop thread.
         if let Some(handle) = self.loop_thread.lock().take() {
             let _ = handle.join();
         }
-
-        let was_registered = {
-            let mut inner = self.inner.lock();
-            let was_registered = inner.state == PhoneState::Registered;
-            inner.state = PhoneState::Disconnected;
-            was_registered
-        };
-        if was_registered {
-            info!("unregistering from server");
-            if let Err(e) = self.tr.unregister(Duration::from_secs(5)) {
-                warn!(error = %e, "unregister failed");
-            }
+        // Join the re-registration thread if one is running.
+        if let Some(handle) = rereg_handle {
+            let _ = handle.join();
         }
     }
 
@@ -212,37 +225,49 @@ impl Drop for Registry {
     }
 }
 
-fn registration_lost(inner: &Mutex<Inner>) {
+/// Called when the transport connection drops.
+fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Config) {
     warn!("transport drop detected — attempting re-registration");
-    let cbs = {
+    let (cbs, should_reregister) = {
         let mut guard = inner.lock();
-        if guard.stopped {
+        if guard.state == PhoneState::Disconnected || guard.reregistering || guard.stopped {
             return;
         }
         guard.state = PhoneState::Registering;
-        guard.on_unregistered.clone()
+        guard.reregistering = true;
+        (guard.on_unregistered.clone(), true)
     };
+
     for f in cbs {
         spawn_callback(move || f());
     }
+
+    if should_reregister {
+        let inner_clone = Arc::clone(inner);
+        let tr = Arc::clone(tr);
+        let cfg = cfg.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = reregister(&inner_clone, &tr, &cfg);
+            let mut guard = inner_clone.lock();
+            guard.reregistering = false;
+            guard.rereg_thread = None;
+        });
+        // Store the handle so stop() can join it.
+        inner.lock().rereg_thread = Some(handle);
+    }
 }
 
-/// Runs one batch of re-registration attempts.
-fn reregister(
-    inner: &Mutex<Inner>,
-    tr: &dyn SipTransport,
-    cfg: &Config,
-    stop_rx: &Receiver<()>,
-) -> Result<()> {
+/// Re-registration attempt after a transport drop.
+fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Config) -> Result<()> {
     let mut last_code: u16 = 0;
     let mut last_reason: String = String::new();
 
     for attempt in 0..cfg.register_max_retry {
-        if (attempt > 0
-            && stop_rx.recv_timeout(cfg.register_retry) != Err(RecvTimeoutError::Timeout))
-            || inner.lock().stopped
-        {
-            return Err(Error::Other("registry stopped".into()));
+        if attempt > 0 {
+            if inner.lock().stopped {
+                return Err(Error::Other("registry stopped".into()));
+            }
+            std::thread::sleep(cfg.register_retry);
         }
 
         let result = tr.send_request("REGISTER", None, cfg.register_expiry);
@@ -259,9 +284,6 @@ fn reregister(
             let cbs = {
                 let mut guard = inner.lock();
                 guard.state = PhoneState::Registered;
-                if guard.stopped {
-                    return Ok(());
-                }
                 guard.on_registered.clone()
             };
             for f in cbs {
@@ -277,13 +299,10 @@ fn reregister(
     warn!(
         last_code,
         last_reason = %last_reason,
-        "re-REGISTER failed — retry batch exhausted"
+        "re-REGISTER failed — all retries exhausted"
     );
     let cbs = {
         let mut guard = inner.lock();
-        if guard.stopped {
-            return Err(Error::Other("registry stopped".into()));
-        }
         guard.state = PhoneState::RegistrationFailed;
         guard.on_error.clone()
     };
@@ -298,55 +317,49 @@ fn reregister(
     Err(err)
 }
 
-/// Background loop: periodic refresh, NAT keepalive, and serialized recovery.
+/// Background loop: periodic refresh and NAT keepalive.
 fn registry_loop(
     tr: Arc<dyn SipTransport>,
     cfg: Config,
     inner: Arc<Mutex<Inner>>,
-    stop_rx: Receiver<()>,
-    mut drop_rx: Receiver<()>,
+    stop_rx: crossbeam_channel::Receiver<()>,
 ) {
     let refresh_interval = cfg.register_expiry / 2;
-    let retry_interval = cfg.register_retry.max(Duration::from_millis(10));
-    let mut next_register = Instant::now() + refresh_interval;
-    let mut recovering = false;
-    let keepalive = cfg
-        .nat_keepalive_interval
-        .map(|interval| channel::tick(interval.max(Duration::from_millis(500))))
-        .unwrap_or_else(channel::never);
+    let keepalive_interval = cfg.nat_keepalive_interval;
+
+    let mut last_refresh = std::time::Instant::now();
+    let mut last_keepalive = std::time::Instant::now();
 
     loop {
-        let timer = channel::after(next_register.saturating_duration_since(Instant::now()));
-        let dropped = channel::select_biased! {
-            recv(stop_rx) -> _ => return,
-            recv(drop_rx) -> event => {
-                if event.is_err() {
-                    drop_rx = channel::never();
-                }
-                event.is_ok()
-            },
-            recv(timer) -> _ => false,
-            recv(keepalive) -> _ => !recovering && tr.send_keepalive().is_err(),
-        };
+        // Sleep in short increments so we can check the stop signal.
+        let tick = Duration::from_millis(500);
+        match stop_rx.recv_timeout(tick) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+        }
 
-        if (dropped && !recovering) || Instant::now() >= next_register {
-            let refreshed = !dropped
-                && !recovering
-                && matches!(tr.send_request("REGISTER", None, cfg.register_expiry), Ok(msg) if msg.status_code == 200);
-            let delay = if refreshed {
-                refresh_interval
-            } else {
-                if !recovering {
-                    registration_lost(&inner);
+        if inner.lock().stopped {
+            return;
+        }
+
+        // Refresh timer.
+        if last_refresh.elapsed() >= refresh_interval {
+            last_refresh = std::time::Instant::now();
+            let result = tr.send_request("REGISTER", None, cfg.register_expiry);
+            match result {
+                Ok(msg) if msg.status_code == 200 => {}
+                _ => {
+                    handle_drop(&inner, &tr, &cfg);
                 }
-                let result = reregister(&inner, tr.as_ref(), &cfg, &stop_rx);
-                recovering = result.is_err();
-                match result {
-                    Err(Error::RegistrationFailed { code: 0, .. }) => retry_interval,
-                    _ => refresh_interval,
-                }
-            };
-            next_register = Instant::now() + delay;
+            }
+        }
+
+        // NAT keepalive timer.
+        if let Some(interval) = keepalive_interval {
+            if last_keepalive.elapsed() >= interval {
+                last_keepalive = std::time::Instant::now();
+                let _ = tr.send_keepalive();
+            }
         }
     }
 }

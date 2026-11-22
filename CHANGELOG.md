@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Reconnect SIP signaling and resume registration after a socket failure or network outage.
+- Open a fresh SIP socket when retrying a failed REGISTER.
 
 ## [0.6.0] - 2026-05-13
 

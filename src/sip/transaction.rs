@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use tracing::{debug, warn};
 
@@ -24,22 +23,34 @@ type RequestCallback = Arc<dyn Fn(Message, SocketAddr) + Send + Sync>;
 struct Inner {
     pending: HashMap<String, PendingTx>,
     on_request: Option<RequestCallback>,
-    on_drop: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Dropped by the reader on connection failure or by stop().
-    done_tx: Option<Sender<()>>,
+    stopped: bool,
+}
+
+struct Connection {
+    socket: Option<Box<dyn SipConnection>>,
+    advertised_addr: SocketAddr,
+}
+
+impl Connection {
+    fn socket(&self) -> Result<&dyn SipConnection> {
+        self.socket
+            .as_deref()
+            .ok_or_else(|| Error::Other("sip: socket unavailable".into()))
+    }
 }
 
 /// Manages SIP client transactions.
 /// Dispatches incoming responses to the correct pending transaction by Via branch,
 /// and incoming requests to the OnRequest callback.
 pub struct TransactionManager {
-    conn: Arc<dyn SipConnection>,
-    local_addr: SocketAddr,
+    conn: Arc<RwLock<Connection>>,
     inner: Arc<Mutex<Inner>>,
     /// Transport name for Via headers (UDP, TCP, TLS).
     transport_name: String,
     /// Append `;rport` (RFC 3581) to auto-generated Via headers when `true`.
     nat: std::sync::atomic::AtomicBool,
+    /// Dropping this sender closes the channel, signaling all receivers to stop.
+    done_tx: Mutex<Option<Sender<()>>>,
     done_rx: Receiver<()>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -48,18 +59,25 @@ impl TransactionManager {
     /// Creates a new TransactionManager and starts its read loop.
     pub fn new(conn: Box<dyn SipConnection>) -> Self {
         let local_addr = conn.local_addr().expect("failed to get local addr");
-        let transport_name = conn.transport_name().to_string();
+        Self::with_advertised_addr(conn, local_addr)
+    }
 
-        // Wrap in Arc so both read loop and write path share the connection.
-        let conn: Arc<dyn SipConnection> = Arc::from(conn);
+    pub(crate) fn with_advertised_addr(
+        socket: Box<dyn SipConnection>,
+        advertised_addr: SocketAddr,
+    ) -> Self {
+        let transport_name = socket.transport_name().to_string();
+        let conn = Arc::new(RwLock::new(Connection {
+            socket: Some(socket),
+            advertised_addr,
+        }));
 
-        let (done_tx, done_rx) = bounded::<()>(0);
         let inner = Arc::new(Mutex::new(Inner {
             pending: HashMap::new(),
             on_request: None,
-            on_drop: None,
-            done_tx: Some(done_tx),
+            stopped: false,
         }));
+        let (done_tx, done_rx) = bounded::<()>(0);
 
         let thread = {
             let inner = Arc::clone(&inner);
@@ -73,13 +91,32 @@ impl TransactionManager {
 
         Self {
             conn,
-            local_addr,
             inner,
             transport_name,
             nat: std::sync::atomic::AtomicBool::new(false),
+            done_tx: Mutex::new(Some(done_tx)),
             done_rx,
             thread: Mutex::new(Some(thread)),
         }
+    }
+
+    pub(crate) fn advertised_addr(&self) -> SocketAddr {
+        self.conn.read().advertised_addr
+    }
+
+    pub(crate) fn replace_socket(
+        &self,
+        open: impl FnOnce() -> Result<(Box<dyn SipConnection>, SocketAddr)>,
+    ) -> Result<()> {
+        let mut conn = self.conn.write();
+        // Release the old socket first so a fixed UDP port can be rebound.
+        conn.socket.take();
+        let (socket, advertised_addr) = open()?;
+        *conn = Connection {
+            socket: Some(socket),
+            advertised_addr,
+        };
+        Ok(())
     }
 
     /// Returns the transport name (UDP, TCP, TLS) for Via header construction.
@@ -95,22 +132,34 @@ impl TransactionManager {
 
     /// Shuts down the read loop and cancels all pending transactions.
     pub fn stop(&self) {
-        {
-            let mut inner = self.inner.lock();
-            inner.pending.clear();
-            inner.done_tx.take();
+        let mut inner = self.inner.lock();
+        if inner.stopped {
+            return;
         }
-        let handle = self.thread.lock().take();
-        if let Some(handle) = handle {
-            if handle.thread().id() != std::thread::current().id() {
-                let _ = handle.join();
-            }
+        inner.stopped = true;
+        inner.pending.clear();
+        drop(inner);
+        // Drop the sender to close the channel — wakes all receivers.
+        self.done_tx.lock().take();
+        // Join the read loop thread.
+        if let Some(handle) = self.thread.lock().take() {
+            let _ = handle.join();
         }
     }
 
     /// Sends a SIP request and waits for the first response.
     /// Auto-generates a Via header with a unique branch if none is set.
     pub fn send(&self, req: &mut Message, dst: SocketAddr, timeout: Duration) -> Result<Message> {
+        {
+            let inner = self.inner.lock();
+            if inner.stopped {
+                return Err(Error::Other("sip: transaction manager stopped".into()));
+            }
+        }
+
+        let conn = self.conn.read();
+        let socket = conn.socket()?;
+
         // Generate branch and set Via if not present.
         let mut branch = req.via_branch().to_string();
         if branch.is_empty() {
@@ -123,9 +172,12 @@ impl TransactionManager {
             } else {
                 ""
             };
+            let local_addr = socket
+                .local_addr()
+                .map_err(|e| Error::Other(format!("sip: local addr: {e}")))?;
             let via = format!(
                 "SIP/2.0/{} {};branch={}{}",
-                self.transport_name, self.local_addr, branch, rport
+                self.transport_name, local_addr, branch, rport
             );
             req.set_header("Via", &via);
         }
@@ -134,9 +186,6 @@ impl TransactionManager {
         let resp_rx = {
             let (resp_tx, resp_rx) = bounded(8);
             let mut inner = self.inner.lock();
-            if inner.done_tx.is_none() {
-                return Err(Error::Other("sip: transaction manager stopped".into()));
-            }
             inner.pending.insert(
                 branch.clone(),
                 PendingTx {
@@ -148,19 +197,21 @@ impl TransactionManager {
         };
 
         // Send the request.
-        if let Err(e) = self.conn.send(&req.to_bytes(), dst) {
+        let result = socket.send(&req.to_bytes(), dst);
+        drop(conn);
+        if let Err(e) = result {
             self.remove_tx(&branch);
             return Err(Error::Other(format!("sip: send: {e}")));
         }
 
         // Wait for first response, timeout, or stop.
-        crossbeam_channel::select_biased! {
+        crossbeam_channel::select! {
             recv(resp_rx) -> msg => {
                 msg.map_err(|_| Error::Other("sip: transaction manager stopped".into()))
             }
             recv(self.done_rx) -> _ => {
                 self.remove_tx(&branch);
-                Err(Error::Other("sip: connection closed".into()))
+                Err(Error::Other("sip: transaction manager stopped".into()))
             }
             default(timeout) => {
                 self.remove_tx(&branch);
@@ -197,7 +248,7 @@ impl TransactionManager {
                 msg.map(Some).map_err(|_| Error::Other("sip: transaction manager stopped".into()))
             }
             recv(self.done_rx) -> _ => {
-                Err(Error::Other("sip: connection closed".into()))
+                Err(Error::Other("sip: transaction manager stopped".into()))
             }
             recv(cancelled) -> _ => Ok(None),
             recv(timeout) -> _ => {
@@ -214,20 +265,11 @@ impl TransactionManager {
         self.inner.lock().on_request = Some(Arc::new(f));
     }
 
-    pub(crate) fn on_drop<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_drop = Some(Arc::new(f));
-    }
-
-    pub(crate) fn has_failed(&self) -> bool {
-        self.done_rx.try_recv() == Err(crossbeam_channel::TryRecvError::Disconnected)
-    }
-
     /// Sends raw data (e.g., keepalive) without transaction tracking.
     pub fn send_raw(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
-        if self.has_failed() {
-            return Err(Error::Other("sip: connection closed".into()));
-        }
         self.conn
+            .read()
+            .socket()?
             .send(data, dst)
             .map_err(|e| Error::Other(format!("sip: send_raw: {}", e)))
     }
@@ -240,42 +282,40 @@ impl TransactionManager {
 
 impl Drop for TransactionManager {
     fn drop(&mut self) {
-        self.stop();
+        // Use direct field access (no lock needed since we have &mut self).
+        let mut inner = self.inner.lock();
+        if inner.stopped {
+            return;
+        }
+        inner.stopped = true;
+        inner.pending.clear();
+        drop(inner);
+        self.done_tx.get_mut().take();
+        if let Some(handle) = self.thread.get_mut().take() {
+            let _ = handle.join();
+        }
     }
 }
 
 /// Read loop runs on a dedicated thread.
-fn read_loop(conn: Arc<dyn SipConnection>, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
+fn read_loop(conn: Arc<RwLock<Connection>>, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
     loop {
-        if done_rx.try_recv() == Err(crossbeam_channel::TryRecvError::Disconnected) {
+        // Check if stopped (channel closed).
+        if done_rx.try_recv().is_ok() || done_rx.is_empty() && inner.lock().stopped {
             return;
         }
 
-        let (data, addr) = match conn.receive(Duration::from_millis(500)) {
-            Ok(pair) => pair,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) =>
-            {
-                continue
-            }
-            Err(e) => {
-                let on_drop = {
-                    let mut guard = inner.lock();
-                    // Wake pending transactions. Already received replies
-                    // remain in their response channels.
-                    if guard.done_tx.take().is_none() {
-                        return;
-                    }
-                    guard.on_drop.clone()
-                };
-                debug!(error = %e, "SIP socket closed");
-                if let Some(on_drop) = on_drop {
-                    on_drop();
-                }
-                return;
+        let received = conn
+            .read()
+            .socket
+            .as_ref()
+            .map(|socket| socket.receive(Duration::from_millis(500)));
+        let (data, addr) = match received {
+            Some(Ok(pair)) => pair,
+            Some(Err(_)) => continue, // timeout or error — loop again
+            None => {
+                let _ = done_rx.recv_timeout(Duration::from_millis(10));
+                continue;
             }
         };
 

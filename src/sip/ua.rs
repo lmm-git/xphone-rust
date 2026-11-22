@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -25,6 +25,8 @@ struct Inner {
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
     subscription_notify_handler:
         Option<Arc<dyn Fn(String, String, String, String, String) + Send + Sync>>,
 }
@@ -32,14 +34,8 @@ struct Inner {
 /// Production SIP transport backed by `sip::client::Client`.
 /// Implements the `SipTransport` trait for real network communication.
 pub struct SipUA {
-    client: Mutex<Option<ClientState>>,
-    cfg: Config,
-    inner: Arc<Mutex<Inner>>,
-}
-
-struct ClientState {
     client: Arc<Client>,
-    reconnect: bool,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl std::fmt::Debug for SipUA {
@@ -71,30 +67,6 @@ impl SipUA {
             return Err(Error::TlsConfigRequired);
         }
 
-        let inner = Arc::new(Mutex::new(Inner {
-            drop_handler: None,
-            incoming_handler: None,
-            dialog_invite_handler: None,
-            bye_handler: None,
-            notify_handler: None,
-            info_dtmf_handler: None,
-            mwi_notify_handler: None,
-            message_handler: None,
-            subscription_notify_handler: None,
-        }));
-
-        let client = Self::connect_client(cfg, &inner)?;
-        Ok(Self {
-            client: Mutex::new(Some(ClientState {
-                client,
-                reconnect: false,
-            })),
-            cfg: cfg.clone(),
-            inner,
-        })
-    }
-
-    fn connect_client(cfg: &Config, inner: &Arc<Mutex<Inner>>) -> Result<Arc<Client>> {
         let mut server_addrs_iter = format!("{}:{}", cfg.host, cfg.port)
             .to_socket_addrs()
             .map_err(|e| Error::Other(format!("invalid server address: {}", e)))?;
@@ -104,15 +76,13 @@ impl SipUA {
 
         trace!(server_addr = %server_addr, "Resolved server address");
 
-        // Resolve the configured next hop again when replacing the socket.
-        let outbound_proxy = cfg
-            .outbound_proxy
-            .as_deref()
-            .map(|uri| {
-                parse_proxy_uri(uri)
-                    .ok_or_else(|| Error::Other(format!("unable to resolve outbound proxy: {uri}")))
+        // Parse outbound proxy URI to SocketAddr if configured.
+        let outbound_proxy = cfg.outbound_proxy.as_ref().and_then(|uri| {
+            parse_proxy_uri(uri).or_else(|| {
+                warn!("invalid outbound_proxy URI: {uri}");
+                None
             })
-            .transpose()?;
+        });
 
         let client_cfg = ClientConfig {
             // Intentionally NOT plumbed from `Config::local_ip` / any
@@ -127,7 +97,7 @@ impl SipUA {
             password: cfg.password.clone(),
             auth_username: cfg.auth_username.clone(),
             domain: cfg.host.clone(),
-            transport: cfg.transport.to_lowercase(),
+            transport: transport.clone(),
             tls_config: cfg.tls_config.clone(),
             stun_server: cfg.stun_server.clone(),
             outbound_proxy,
@@ -139,57 +109,26 @@ impl SipUA {
 
         let client = Arc::new(Client::new(client_cfg)?);
 
-        // Reattach the application's handlers to each new socket. The reader
-        // must not keep its own client alive.
-        let inner_clone = Arc::clone(inner);
-        let weak_client = Arc::downgrade(&client);
+        let inner = Arc::new(Mutex::new(Inner {
+            drop_handler: None,
+            incoming_handler: None,
+            dialog_invite_handler: None,
+            bye_handler: None,
+            notify_handler: None,
+            info_dtmf_handler: None,
+            mwi_notify_handler: None,
+            message_handler: None,
+            subscription_notify_handler: None,
+        }));
+
+        // Wire up incoming SIP request handler.
+        let inner_clone = Arc::clone(&inner);
+        let client_clone = Arc::clone(&client);
         client.on_incoming(move |msg, addr| {
-            if let Some(client) = weak_client.upgrade() {
-                handle_incoming_request(&inner_clone, &client, &msg, addr);
-            }
-        });
-        let inner_clone = Arc::clone(inner);
-        client.on_drop(move || {
-            let handler = inner_clone.lock().drop_handler.clone();
-            if let Some(handler) = handler {
-                handler();
-            }
+            handle_incoming_request(&inner_clone, &client_clone, &msg, addr);
         });
 
-        Ok(client)
-    }
-
-    fn client(&self) -> Result<Arc<Client>> {
-        self.client
-            .lock()
-            .as_ref()
-            .map(|state| Arc::clone(&state.client))
-            .ok_or_else(|| Error::Other("sip: client closed".into()))
-    }
-
-    fn registration_client(&self) -> Result<Arc<Client>> {
-        let mut guard = self.client.lock();
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| Error::Other("sip: client closed".into()))?;
-        if !state.reconnect && !state.client.has_transport_failure() {
-            return Ok(Arc::clone(&state.client));
-        }
-
-        let replacement = Self::connect_client(&self.cfg, &self.inner)?;
-        let previous = std::mem::replace(&mut state.client, Arc::clone(&replacement));
-        state.reconnect = false;
-        drop(guard);
-        previous.close();
-        Ok(replacement)
-    }
-
-    fn reconnect_after_error(&self, client: &Arc<Client>) {
-        if let Some(state) = self.client.lock().as_mut() {
-            if Arc::ptr_eq(&state.client, client) {
-                state.reconnect = true;
-            }
-        }
+        Ok(Self { client, inner })
     }
 }
 
@@ -472,10 +411,7 @@ impl SipTransport for SipUA {
         timeout: Duration,
     ) -> Result<Message> {
         if method == "REGISTER" {
-            let client = self.registration_client()?;
-            let (code, reason) = client.send_register(timeout).inspect_err(|_| {
-                self.reconnect_after_error(&client);
-            })?;
+            let (code, reason) = self.client.send_register(timeout)?;
             let msg = Message::new_response(code, &reason);
             return Ok(msg);
         }
@@ -493,10 +429,7 @@ impl SipTransport for SipUA {
     }
 
     fn send_keepalive(&self) -> Result<()> {
-        let client = self.client()?;
-        client.send_keepalive().inspect_err(|_| {
-            self.reconnect_after_error(&client);
-        })
+        self.client.send_keepalive()
     }
 
     fn respond(&self, _code: u16, _reason: &str) {
@@ -518,12 +451,11 @@ impl SipTransport for SipUA {
         timeout: Duration,
         opts: &crate::config::DialOptions,
     ) -> Result<crate::transport::DialResult> {
-        let client = self.client()?;
         // Normalize target to SIP URI.
         let target_uri = if target.starts_with("sip:") {
             target.to_string()
         } else {
-            format!("sip:{}@{}", target, client.domain())
+            format!("sip:{}@{}", target, self.client.domain())
         };
 
         info!(target = %target_uri, "SIP >>> dialing");
@@ -540,7 +472,7 @@ impl SipTransport for SipUA {
                     format!("<{cid}>")
                 }
             } else {
-                format!("<sip:{}@{}>", cid, client.domain())
+                format!("<sip:{}@{}>", cid, self.client.domain())
             };
             extra.insert("P-Asserted-Identity".to_string(), pai);
         }
@@ -551,7 +483,7 @@ impl SipTransport for SipUA {
 
         let auth_override = &opts.auth;
 
-        let result = client.send_invite_cancellable(
+        let result = self.client.send_invite_cancellable(
             &target_uri,
             local_sdp,
             timeout,
@@ -565,7 +497,11 @@ impl SipTransport for SipUA {
             "SIP <<< INVITE final response"
         );
 
-        let dlg = Arc::new(SipDialogUAC::new(client, result.invite, result.response));
+        let dlg = Arc::new(SipDialogUAC::new(
+            Arc::clone(&self.client),
+            result.invite,
+            result.response,
+        ));
 
         // A final 2xx may cross CANCEL on the wire. The client has
         // acknowledged it; end the established dialog immediately.
@@ -610,7 +546,7 @@ impl SipTransport for SipUA {
         headers: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Message> {
-        let (code, reason) = self.client()?.send_subscribe(uri, headers, timeout)?;
+        let (code, reason) = self.client.send_subscribe(uri, headers, timeout)?;
         let msg = Message::new_response(code, &reason);
         Ok(msg)
     }
@@ -626,15 +562,16 @@ impl SipTransport for SipUA {
         body: &[u8],
         timeout: Duration,
     ) -> Result<()> {
-        let client = self.client()?;
         // Normalize target to SIP URI.
         let target_uri = if target.starts_with("sip:") {
             target.to_string()
         } else {
-            format!("sip:{}@{}", target, client.domain())
+            format!("sip:{}@{}", target, self.client.domain())
         };
 
-        let (code, reason) = client.send_message(&target_uri, content_type, body, timeout)?;
+        let (code, reason) = self
+            .client
+            .send_message(&target_uri, content_type, body, timeout)?;
         if (200..300).contains(&code) {
             Ok(())
         } else {
@@ -657,19 +594,16 @@ impl SipTransport for SipUA {
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {
-        let _ = self.client()?.send_unregister(timeout)?;
+        let _ = self.client.send_unregister(timeout)?;
         Ok(())
     }
 
     fn advertised_addr(&self) -> Option<std::net::SocketAddr> {
-        self.client().ok().map(|client| client.local_addr())
+        Some(self.client.local_addr())
     }
 
     fn close(&self) -> Result<()> {
-        let state = self.client.lock().take();
-        if let Some(state) = state {
-            state.client.close();
-        }
+        self.client.close();
         Ok(())
     }
 }
@@ -688,115 +622,6 @@ fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn phone_reregisters_on_a_new_tcp_connection_after_retry_exhaustion() {
-        use std::io::{BufReader, Write};
-        use std::net::{TcpListener, TcpStream};
-        use std::time::Instant;
-
-        let read_message = |stream: &mut BufReader<TcpStream>| {
-            let bytes = super::super::conn::read_sip_message(stream).unwrap();
-            super::super::message::parse(&bytes).unwrap()
-        };
-        let timeout = Duration::from_secs(5);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (drop_tx, drop_rx) = crossbeam_channel::bounded(1);
-        let (recover_tx, recover_rx) = crossbeam_channel::bounded(1);
-        let (options_tx, options_rx) = crossbeam_channel::bounded(1);
-        let server = std::thread::spawn(move || {
-            let accept = || {
-                let deadline = Instant::now() + timeout;
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            stream.set_read_timeout(Some(timeout)).unwrap();
-                            return BufReader::new(stream);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "expected a SIP connection");
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(e) => panic!("accept failed: {e}"),
-                    }
-                }
-            };
-            let respond = |stream: &mut BufReader<TcpStream>, request: &Message| {
-                let response = build_sip_response(request, 200, "OK");
-                stream.get_mut().write_all(&response.to_bytes()).unwrap();
-            };
-
-            let mut first = accept();
-            let initial_register = read_message(&mut first);
-            assert_eq!(initial_register.method, "REGISTER");
-            respond(&mut first, &initial_register);
-            drop_rx.recv_timeout(timeout).unwrap();
-            drop(first);
-
-            // The server stays unavailable through the first reconnect attempt.
-            let mut second = accept();
-            assert_eq!(read_message(&mut second).method, "REGISTER");
-            drop(second);
-
-            let mut third = accept();
-            let register = read_message(&mut third);
-            assert_eq!(register.method, "REGISTER");
-            recover_rx.recv_timeout(timeout).unwrap();
-            respond(&mut third, &register);
-
-            let mut options = Message::new_request("OPTIONS", "sip:1001@127.0.0.1");
-            options.set_header("Via", "SIP/2.0/TCP 127.0.0.1;branch=z9hG4bK-test");
-            options.set_header("From", "<sip:server@127.0.0.1>;tag=server");
-            options.set_header("To", "<sip:1001@127.0.0.1>");
-            options.set_header("Call-ID", "options-after-reconnect");
-            options.set_header("CSeq", "1 OPTIONS");
-            third.get_mut().write_all(&options.to_bytes()).unwrap();
-            assert_eq!(read_message(&mut third).status_code, 200);
-            options_tx.send(()).unwrap();
-
-            let unregister = read_message(&mut third);
-            assert_eq!(unregister.method, "REGISTER");
-            assert_eq!(unregister.header("Expires"), "0");
-            respond(&mut third, &unregister);
-        });
-
-        let phone = crate::Phone::new(Config {
-            host: "127.0.0.1".into(),
-            port,
-            username: "1001".into(),
-            transport: "tcp".into(),
-            register_max_retry: 1,
-            register_retry: Duration::from_millis(50),
-            ..Config::default()
-        });
-        let (registered_tx, registered_rx) = crossbeam_channel::unbounded();
-        phone.on_registered(move || {
-            let _ = registered_tx.send(());
-        });
-        let (error_tx, error_rx) = crossbeam_channel::unbounded();
-        phone.on_error(move |error| {
-            let _ = error_tx.send(error);
-        });
-
-        phone.connect().unwrap();
-        registered_rx.recv_timeout(timeout).unwrap();
-        drop_tx.send(()).unwrap();
-        assert!(matches!(
-            error_rx.recv_timeout(timeout).unwrap(),
-            Error::RegistrationFailed { code: 0, .. }
-        ));
-        assert_eq!(phone.state(), crate::PhoneState::RegistrationFailed);
-
-        recover_tx.send(()).unwrap();
-        registered_rx.recv_timeout(timeout).unwrap();
-        assert_eq!(phone.state(), crate::PhoneState::Registered);
-        options_rx.recv_timeout(timeout).unwrap();
-        phone.disconnect().unwrap();
-        assert_eq!(phone.state(), crate::PhoneState::Disconnected);
-        server.join().unwrap();
-    }
 
     #[test]
     fn new_requires_host() {

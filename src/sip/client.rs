@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::auth::{self, Credentials};
-use super::conn::{self, TlsConfig};
+use super::conn::{self, SipConnection, TlsConfig};
 use super::dialog::extract_uri;
 use super::message::Message;
 use super::transaction::{self, TransactionManager};
@@ -93,19 +93,35 @@ pub struct Client {
     cfg: ClientConfig,
     cseq: AtomicU32,
     call_id: String,
-    /// The address advertised in Via/Contact headers (routable IP + bound port).
-    advertised_addr: SocketAddr,
     /// Via transport tag (UDP, TCP, TLS).
     via_transport: String,
     closed: Mutex<bool>,
+    // Serializes REGISTER attempts while tracking whether to reopen the socket.
+    register_needs_socket: Mutex<bool>,
 }
 
 impl Client {
     /// Creates a new SIP client, binding or connecting based on transport.
     pub fn new(cfg: ClientConfig) -> Result<Self> {
-        // Use the outbound proxy as the transport peer when set. For TCP/TLS
-        // this is load-bearing: the connection is established once, and
-        // `send`'s destination argument is ignored by the stream.
+        let (socket, advertised_addr) = Self::open_socket(&cfg)?;
+        let via_transport = socket.transport_name().to_string();
+        let tm = TransactionManager::with_advertised_addr(socket, advertised_addr);
+        tm.set_nat(cfg.nat);
+
+        Ok(Self {
+            tm,
+            cfg,
+            cseq: AtomicU32::new(0),
+            call_id: transaction::generate_branch(),
+            via_transport,
+            closed: Mutex::new(false),
+            register_needs_socket: Mutex::new(false),
+        })
+    }
+
+    fn open_socket(cfg: &ClientConfig) -> Result<(Box<dyn SipConnection>, SocketAddr)> {
+        // For TCP and TLS the socket connects directly to the selected peer.
+        // The destination passed to send() is only used by UDP.
         let transport_peer = cfg.outbound_proxy.unwrap_or(cfg.server_addr);
         let sip_conn = conn::connect(
             &cfg.transport,
@@ -120,15 +136,10 @@ impl Client {
         let local_addr = sip_conn
             .local_addr()
             .map_err(|e| Error::Other(format!("sip: local addr: {}", e)))?;
-        let via_transport = sip_conn.transport_name().to_string();
-        let tm = TransactionManager::new(sip_conn);
-        tm.set_nat(cfg.nat);
-        let call_id = transaction::generate_branch();
-
         // Compute a routable IP to advertise in Via/Contact headers.
         // Priority: STUN mapped address > UDP connect heuristic > local address.
         let advertised_addr = if local_addr.ip().is_unspecified() {
-            if let Some(stun_addr) = Self::try_stun(&cfg) {
+            if let Some(stun_addr) = Self::try_stun(cfg) {
                 info!("STUN mapped address: {}", stun_addr);
                 SocketAddr::new(stun_addr.ip(), local_addr.port())
             } else {
@@ -152,15 +163,7 @@ impl Client {
             local_addr
         };
 
-        Ok(Self {
-            tm,
-            cfg,
-            cseq: AtomicU32::new(0),
-            call_id,
-            advertised_addr,
-            via_transport,
-            closed: Mutex::new(false),
-        })
+        Ok((sip_conn, advertised_addr))
     }
 
     /// Attempts a STUN Binding Request to discover the NAT-mapped address.
@@ -195,7 +198,7 @@ impl Client {
     /// Returns the advertised address (routable IP + bound port)
     /// for use in Contact/Via headers.
     pub fn local_addr(&self) -> SocketAddr {
-        self.advertised_addr
+        self.tm.advertised_addr()
     }
 
     /// Returns the Via transport tag (UDP, TCP, TLS).
@@ -217,22 +220,29 @@ impl Client {
         self.tm.on_request(f);
     }
 
-    pub(crate) fn on_drop<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.tm.on_drop(f);
-    }
-
-    pub(crate) fn has_transport_failure(&self) -> bool {
-        self.tm.has_failed()
-    }
-
     /// Sends a REGISTER request.
     /// Handles 401 auth challenges automatically.
     /// Returns (response_code, reason).
     pub fn send_register(&self, timeout: Duration) -> Result<(u16, String)> {
-        if *self.closed.lock() {
-            return Err(Error::Other("sip: client closed".into()));
+        let mut needs_socket = self.register_needs_socket.lock();
+        {
+            let closed = self.closed.lock();
+            if *closed {
+                return Err(Error::Other("sip: client closed".into()));
+            }
+            if *needs_socket {
+                self.tm.replace_socket(|| Self::open_socket(&self.cfg))?;
+            }
         }
 
+        let result = self.register(timeout);
+        // SIP rejections arrive as response codes. An error means the
+        // transaction failed, so the next REGISTER uses a fresh socket.
+        *needs_socket = result.is_err();
+        result
+    }
+
+    fn register(&self, timeout: Duration) -> Result<(u16, String)> {
         let request_uri = format!("sip:{}", self.cfg.domain);
         let mut req = self.build_request("REGISTER", &request_uri, None);
 
@@ -801,7 +811,7 @@ impl Client {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Message {
         let seq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
-        let local = self.advertised_addr;
+        let local = self.local_addr();
         let from_tag = &transaction::generate_branch()[..15];
         let invite_call_id = transaction::generate_branch();
 
@@ -876,7 +886,7 @@ impl Client {
         ack.set_header("CSeq", &format!("{} ACK", cseq_num));
         ack.set_header("Max-Forwards", "70");
         ack.set_header("User-Agent", &self.cfg.user_agent);
-        ack.set_header("Via", &self.build_via(self.advertised_addr, branch));
+        ack.set_header("Via", &self.build_via(self.local_addr(), branch));
         ack
     }
 
@@ -888,7 +898,7 @@ impl Client {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Message {
         let seq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
-        let local = self.advertised_addr;
+        let local = self.local_addr();
 
         let mut msg = Message::new_request(method, request_uri);
 
@@ -946,6 +956,59 @@ mod tests {
         assert!(client.local_addr().port() > 0);
         assert_eq!(client.via_transport(), "UDP");
         client.close();
+    }
+
+    #[test]
+    fn register_retries_on_a_fresh_tcp_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = test_config(listener.local_addr().unwrap().port());
+        cfg.transport = "tcp".into();
+        let (disconnect, disconnected) = crossbeam_channel::bounded(0);
+        let server = std::thread::spawn(move || {
+            let register = || {
+                let (stream, peer) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut headers = Vec::new();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    headers.extend_from_slice(line.as_bytes());
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let request = super::super::message::parse(&headers).unwrap();
+                assert_eq!(request.method, "REGISTER");
+                assert!(request.header("Contact").contains(&peer.to_string()));
+                assert!(request.header("Via").contains(&peer.to_string()));
+                let response = super::super::dialog::build_sip_response(&request, 200, "OK");
+                reader.get_mut().write_all(&response.to_bytes()).unwrap();
+                (reader, request)
+            };
+
+            let (first, initial) = register();
+            disconnected.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(first);
+            let (_, retry) = register();
+            assert_eq!(initial.header("Call-ID"), retry.header("Call-ID"));
+            assert_ne!(initial.header("Contact"), retry.header("Contact"));
+        });
+
+        let client = Client::new(cfg).unwrap();
+        let timeout = Duration::from_secs(2);
+        assert_eq!(client.send_register(timeout).unwrap().0, 200);
+        disconnect.send(()).unwrap();
+        assert!(client.send_register(Duration::from_millis(200)).is_err());
+        assert_eq!(client.send_register(timeout).unwrap().0, 200);
+        client.close();
+        server.join().unwrap();
     }
 
     #[test]
