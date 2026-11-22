@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 
 /// Pending client transaction waiting for a response.
 struct PendingTx {
-    resp_tx: Option<Sender<Message>>,
+    resp_tx: Sender<Message>,
     resp_rx: Receiver<Message>,
 }
 
@@ -25,20 +25,8 @@ struct Inner {
     pending: HashMap<String, PendingTx>,
     on_request: Option<RequestCallback>,
     on_drop: Option<Arc<dyn Fn() + Send + Sync>>,
-    read_error: Option<String>,
-    stopped: bool,
-}
-
-impl Inner {
-    fn check_connection(&self) -> Result<()> {
-        if self.stopped {
-            Err(Error::Other("sip: transaction manager stopped".into()))
-        } else if let Some(error) = &self.read_error {
-            Err(Error::Other(error.clone()))
-        } else {
-            Ok(())
-        }
-    }
+    /// Dropped by the reader on connection failure or by stop().
+    done_tx: Option<Sender<()>>,
 }
 
 /// Manages SIP client transactions.
@@ -52,8 +40,6 @@ pub struct TransactionManager {
     transport_name: String,
     /// Append `;rport` (RFC 3581) to auto-generated Via headers when `true`.
     nat: std::sync::atomic::AtomicBool,
-    /// Dropping this sender closes the channel, signaling all receivers to stop.
-    done_tx: Mutex<Option<Sender<()>>>,
     done_rx: Receiver<()>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -67,14 +53,13 @@ impl TransactionManager {
         // Wrap in Arc so both read loop and write path share the connection.
         let conn: Arc<dyn SipConnection> = Arc::from(conn);
 
+        let (done_tx, done_rx) = bounded::<()>(0);
         let inner = Arc::new(Mutex::new(Inner {
             pending: HashMap::new(),
             on_request: None,
             on_drop: None,
-            read_error: None,
-            stopped: false,
+            done_tx: Some(done_tx),
         }));
-        let (done_tx, done_rx) = bounded::<()>(0);
 
         let thread = {
             let inner = Arc::clone(&inner);
@@ -92,7 +77,6 @@ impl TransactionManager {
             inner,
             transport_name,
             nat: std::sync::atomic::AtomicBool::new(false),
-            done_tx: Mutex::new(Some(done_tx)),
             done_rx,
             thread: Mutex::new(Some(thread)),
         }
@@ -111,17 +95,13 @@ impl TransactionManager {
 
     /// Shuts down the read loop and cancels all pending transactions.
     pub fn stop(&self) {
-        let mut inner = self.inner.lock();
-        if inner.stopped {
-            return;
+        {
+            let mut inner = self.inner.lock();
+            inner.pending.clear();
+            inner.done_tx.take();
         }
-        inner.stopped = true;
-        inner.pending.clear();
-        drop(inner);
-        // Drop the sender to close the channel — wakes all receivers.
-        self.done_tx.lock().take();
-        // Join the read loop thread.
-        if let Some(handle) = self.thread.lock().take() {
+        let handle = self.thread.lock().take();
+        if let Some(handle) = handle {
             if handle.thread().id() != std::thread::current().id() {
                 let _ = handle.join();
             }
@@ -154,11 +134,13 @@ impl TransactionManager {
         let resp_rx = {
             let (resp_tx, resp_rx) = bounded(8);
             let mut inner = self.inner.lock();
-            inner.check_connection()?;
+            if inner.done_tx.is_none() {
+                return Err(Error::Other("sip: transaction manager stopped".into()));
+            }
             inner.pending.insert(
                 branch.clone(),
                 PendingTx {
-                    resp_tx: Some(resp_tx),
+                    resp_tx,
                     resp_rx: resp_rx.clone(),
                 },
             );
@@ -172,16 +154,13 @@ impl TransactionManager {
         }
 
         // Wait for first response, timeout, or stop.
-        crossbeam_channel::select! {
+        crossbeam_channel::select_biased! {
             recv(resp_rx) -> msg => {
-                match msg {
-                    Ok(msg) => Ok(msg),
-                    Err(_) => Err(self.connection_error()),
-                }
+                msg.map_err(|_| Error::Other("sip: transaction manager stopped".into()))
             }
             recv(self.done_rx) -> _ => {
                 self.remove_tx(&branch);
-                Err(Error::Other("sip: transaction manager stopped".into()))
+                Err(Error::Other("sip: connection closed".into()))
             }
             default(timeout) => {
                 self.remove_tx(&branch);
@@ -205,24 +184,20 @@ impl TransactionManager {
     ) -> Result<Option<Message>> {
         let resp_rx = {
             let inner = self.inner.lock();
-            match inner.pending.get(branch) {
-                Some(tx) => tx.resp_rx.clone(),
-                None => {
-                    inner.check_connection()?;
-                    return Err(Error::Other(
-                        "sip: no pending transaction for branch".into(),
-                    ));
-                }
-            }
+            let tx = inner
+                .pending
+                .get(branch)
+                .ok_or_else(|| Error::Other("sip: no pending transaction for branch".into()))?;
+            tx.resp_rx.clone()
         };
 
         let timeout = crossbeam_channel::after(timeout);
         crossbeam_channel::select_biased! {
             recv(resp_rx) -> msg => {
-                msg.map(Some).map_err(|_| self.connection_error())
+                msg.map(Some).map_err(|_| Error::Other("sip: transaction manager stopped".into()))
             }
             recv(self.done_rx) -> _ => {
-                Err(Error::Other("sip: transaction manager stopped".into()))
+                Err(Error::Other("sip: connection closed".into()))
             }
             recv(cancelled) -> _ => Ok(None),
             recv(timeout) -> _ => {
@@ -244,20 +219,14 @@ impl TransactionManager {
     }
 
     pub(crate) fn has_failed(&self) -> bool {
-        self.inner.lock().read_error.is_some()
-    }
-
-    fn connection_error(&self) -> Error {
-        self.inner
-            .lock()
-            .check_connection()
-            .err()
-            .unwrap_or_else(|| Error::Other("sip: transaction cancelled".into()))
+        self.done_rx.try_recv() == Err(crossbeam_channel::TryRecvError::Disconnected)
     }
 
     /// Sends raw data (e.g., keepalive) without transaction tracking.
     pub fn send_raw(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
-        self.inner.lock().check_connection()?;
+        if self.has_failed() {
+            return Err(Error::Other("sip: connection closed".into()));
+        }
         self.conn
             .send(data, dst)
             .map_err(|e| Error::Other(format!("sip: send_raw: {}", e)))
@@ -271,20 +240,7 @@ impl TransactionManager {
 
 impl Drop for TransactionManager {
     fn drop(&mut self) {
-        // Use direct field access (no lock needed since we have &mut self).
-        let mut inner = self.inner.lock();
-        if inner.stopped {
-            return;
-        }
-        inner.stopped = true;
-        inner.pending.clear();
-        drop(inner);
-        self.done_tx.get_mut().take();
-        if let Some(handle) = self.thread.get_mut().take() {
-            if handle.thread().id() != std::thread::current().id() {
-                let _ = handle.join();
-            }
-        }
+        self.stop();
     }
 }
 
@@ -308,16 +264,14 @@ fn read_loop(conn: Arc<dyn SipConnection>, inner: Arc<Mutex<Inner>>, done_rx: Re
             Err(e) => {
                 let on_drop = {
                     let mut guard = inner.lock();
-                    if guard.stopped {
+                    // Wake pending transactions. Already received replies
+                    // remain in their response channels.
+                    if guard.done_tx.take().is_none() {
                         return;
-                    }
-                    guard.read_error = Some(format!("sip: receive: {e}"));
-                    // Wake waiters but leave buffered SIP responses readable.
-                    for pending in guard.pending.values_mut() {
-                        pending.resp_tx.take();
                     }
                     guard.on_drop.clone()
                 };
+                debug!(error = %e, "SIP socket closed");
                 if let Some(on_drop) = on_drop {
                     on_drop();
                 }
@@ -364,12 +318,8 @@ fn read_loop(conn: Arc<dyn SipConnection>, inner: Arc<Mutex<Inner>>, done_rx: Re
 
         debug!(status = msg.status_code, branch = %branch, "SIP dispatching response to transaction");
         let inner = inner.lock();
-        if let Some(tx) = inner
-            .pending
-            .get(&branch)
-            .and_then(|tx| tx.resp_tx.as_ref())
-        {
-            let _ = tx.try_send(msg);
+        if let Some(tx) = inner.pending.get(&branch) {
+            let _ = tx.resp_tx.try_send(msg);
         } else {
             debug!(branch = %branch, "SIP no pending transaction for branch (stale response)");
         }

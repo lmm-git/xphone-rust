@@ -691,21 +691,14 @@ mod tests {
 
     #[test]
     fn phone_reregisters_on_a_new_tcp_connection_after_retry_exhaustion() {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::{BufReader, Write};
         use std::net::{TcpListener, TcpStream};
         use std::time::Instant;
 
-        fn read_message(stream: &mut BufReader<TcpStream>) -> Message {
-            let mut bytes = Vec::new();
-            loop {
-                let offset = bytes.len();
-                assert_ne!(stream.read_until(b'\n', &mut bytes).unwrap(), 0);
-                if &bytes[offset..] == b"\r\n" {
-                    return super::super::message::parse(&bytes).unwrap();
-                }
-            }
-        }
-
+        let read_message = |stream: &mut BufReader<TcpStream>| {
+            let bytes = super::super::conn::read_sip_message(stream).unwrap();
+            super::super::message::parse(&bytes).unwrap()
+        };
         let timeout = Duration::from_secs(5);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

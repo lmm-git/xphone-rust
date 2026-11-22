@@ -292,7 +292,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 ///
 /// SIP over TCP uses Content-Length to delimit message bodies (RFC 3261 §18.3).
 /// Reads header lines until `\r\n\r\n`, parses Content-Length, then reads the body.
-fn read_sip_message(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
+pub(super) fn read_sip_message(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
     let mut header_data = Vec::with_capacity(2048);
     let mut content_length: usize = 0;
 

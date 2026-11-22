@@ -149,25 +149,22 @@ impl Phone {
         // Perform registration.
         let reg_result = reg.start();
 
-        // Resolve the media IP when the call arrives, since a recovered SIP
-        // connection may advertise a different address.
+        // Determine the local IP for SDP media address.
+        // Priority: explicit config override > STUN-mapped IP > UDP heuristic.
+        let effective_ip = if !self.cfg.local_ip.is_empty() {
+            self.cfg.local_ip.clone()
+        } else if let Some(addr) = tr.advertised_addr() {
+            addr.ip().to_string()
+        } else {
+            local_ip_for(&self.cfg.host)
+        };
+
+        // Wire up incoming INVITE handling (dialog-based for production, simple for mock).
         let inner_clone = Arc::clone(&self.inner);
-        let incoming_transport = Arc::downgrade(&tr);
-        let local_ip = self.cfg.local_ip.clone();
-        let host = self.cfg.host.clone();
+        let incoming_ip = effective_ip.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
         let rtp_port_max = self.cfg.rtp_port_max;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
-            let incoming_ip = if !local_ip.is_empty() {
-                local_ip.clone()
-            } else if let Some(addr) = incoming_transport
-                .upgrade()
-                .and_then(|tr| tr.advertised_addr())
-            {
-                addr.ip().to_string()
-            } else {
-                local_ip_for(&host)
-            };
             handle_dialog_incoming(
                 &inner_clone,
                 dlg,
