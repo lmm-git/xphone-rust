@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -25,8 +25,6 @@ struct Inner {
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
-    #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
     subscription_notify_handler:
         Option<Arc<dyn Fn(String, String, String, String, String) + Send + Sync>>,
 }
