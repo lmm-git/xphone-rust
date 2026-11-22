@@ -25,7 +25,6 @@ type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>
 type CallDtmfCb = Arc<dyn Fn(Arc<Call>, String) + Send + Sync>;
 
 struct Inner {
-    state: PhoneState,
     tr: Option<Arc<dyn SipTransport>>,
     reg: Option<Arc<Registry>>,
     mwi: Option<Arc<MwiSubscriber>>,
@@ -58,6 +57,14 @@ struct Inner {
     last_reg_error: Option<Error>,
 }
 
+impl Inner {
+    fn registration_state(&self) -> PhoneState {
+        self.reg
+            .as_ref()
+            .map_or(PhoneState::Disconnected, |reg| reg.state())
+    }
+}
+
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
 #[derive(Clone)]
 pub struct Phone {
@@ -73,7 +80,6 @@ impl Phone {
         Self {
             cfg,
             inner: Arc::new(Mutex::new(Inner {
-                state: PhoneState::Disconnected,
                 tr: None,
                 reg: None,
                 mwi: None,
@@ -102,18 +108,16 @@ impl Phone {
         info!(host = %self.cfg.host, port = self.cfg.port, user = %self.cfg.username, "Phone connecting");
         let tr = Arc::new(crate::sip::ua::SipUA::new(&self.cfg)?);
         self.connect_with_transport(tr);
-        let state = self.state();
-        if state == PhoneState::Registered {
-            info!("Phone connected and registered");
-            return Ok(());
-        }
-        // Surface the last observed registration error (populated by Registry).
+        // The background registry may already be recovering from a new drop.
+        // Report the result of the synchronous initial REGISTER here.
         let last_err = self.inner.lock().last_reg_error.clone();
-        warn!(err = ?last_err, "Phone registration failed");
-        Err(last_err.unwrap_or(crate::error::Error::RegistrationFailed {
-            code: 0,
-            reason: String::new(),
-        }))
+        if let Some(err) = last_err {
+            warn!(error = %err, "Phone registration failed");
+            return Err(err);
+        }
+
+        info!("Phone connected and registered");
+        Ok(())
     }
 
     /// Connects with a provided transport (test hook).
@@ -145,22 +149,25 @@ impl Phone {
         // Perform registration.
         let reg_result = reg.start();
 
-        // Determine the local IP for SDP media address.
-        // Priority: explicit config override > STUN-mapped IP > UDP heuristic.
-        let effective_ip = if !self.cfg.local_ip.is_empty() {
-            self.cfg.local_ip.clone()
-        } else if let Some(addr) = tr.advertised_addr() {
-            addr.ip().to_string()
-        } else {
-            local_ip_for(&self.cfg.host)
-        };
-
-        // Wire up incoming INVITE handling (dialog-based for production, simple for mock).
+        // Resolve the media IP when the call arrives, since a recovered SIP
+        // connection may advertise a different address.
         let inner_clone = Arc::clone(&self.inner);
-        let incoming_ip = effective_ip.clone();
+        let incoming_transport = Arc::downgrade(&tr);
+        let local_ip = self.cfg.local_ip.clone();
+        let host = self.cfg.host.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
         let rtp_port_max = self.cfg.rtp_port_max;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
+            let incoming_ip = if !local_ip.is_empty() {
+                local_ip.clone()
+            } else if let Some(addr) = incoming_transport
+                .upgrade()
+                .and_then(|tr| tr.advertised_addr())
+            {
+                addr.ip().to_string()
+            } else {
+                local_ip_for(&host)
+            };
             handle_dialog_incoming(
                 &inner_clone,
                 dlg,
@@ -237,16 +244,7 @@ impl Phone {
         inner.reg = Some(reg);
         inner.mwi = mwi;
         inner.subscription_mgr = Some(sub_mgr);
-        match reg_result {
-            Ok(()) => {
-                inner.state = PhoneState::Registered;
-                inner.last_reg_error = None;
-            }
-            Err(e) => {
-                inner.state = PhoneState::RegistrationFailed;
-                inner.last_reg_error = Some(e);
-            }
-        }
+        inner.last_reg_error = reg_result.err();
     }
 
     /// Disconnects the phone: ends all active calls, stops registry, and closes transport.
@@ -254,7 +252,7 @@ impl Phone {
         info!("Phone disconnecting");
         let (reg, tr, unreg_fns, active_calls, mwi, sub_mgr) = {
             let mut inner = self.inner.lock();
-            if inner.state == PhoneState::Disconnected {
+            if inner.registration_state() == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
             }
             let reg = inner.reg.take();
@@ -264,7 +262,6 @@ impl Phone {
             let mwi = inner.mwi.take();
             let sub_mgr = inner.subscription_mgr.take();
             inner.blf_watchers.clear();
-            inner.state = PhoneState::Disconnected;
             (reg, tr, unreg_fns, active_calls, mwi, sub_mgr)
         };
 
@@ -297,7 +294,7 @@ impl Phone {
         info!(target = %target, "Phone dialing");
         let tr = {
             let inner = self.inner.lock();
-            if inner.state != PhoneState::Registered {
+            if inner.registration_state() != PhoneState::Registered {
                 return Err(Error::NotRegistered);
             }
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
@@ -567,7 +564,7 @@ impl Phone {
     pub fn send_message(&self, target: &str, body: &str) -> Result<()> {
         let tr = {
             let inner = self.inner.lock();
-            if inner.state != PhoneState::Registered {
+            if inner.registration_state() != PhoneState::Registered {
                 return Err(Error::NotRegistered);
             }
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
@@ -589,7 +586,7 @@ impl Phone {
     ) -> Result<()> {
         let tr = {
             let inner = self.inner.lock();
-            if inner.state != PhoneState::Registered {
+            if inner.registration_state() != PhoneState::Registered {
                 return Err(Error::NotRegistered);
             }
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
@@ -620,7 +617,7 @@ impl Phone {
     where
         F: Fn(ExtensionStatus, Option<ExtensionState>) + Send + Sync + 'static,
     {
-        if self.inner.lock().state != PhoneState::Registered {
+        if self.inner.lock().registration_state() != PhoneState::Registered {
             return Err(Error::NotRegistered);
         }
         let sub_mgr = self.get_sub_mgr()?;
@@ -703,7 +700,7 @@ impl Phone {
     where
         F: Fn(NotifyEvent) + Send + Sync + 'static,
     {
-        if self.inner.lock().state != PhoneState::Registered {
+        if self.inner.lock().registration_state() != PhoneState::Registered {
             return Err(Error::NotRegistered);
         }
         let sub_mgr = self.get_sub_mgr()?;
@@ -734,7 +731,7 @@ impl Phone {
 
     /// Returns the current phone state.
     pub fn state(&self) -> PhoneState {
-        self.inner.lock().state
+        self.inner.lock().registration_state()
     }
 
     /// Returns the configured SIP server host.

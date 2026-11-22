@@ -217,6 +217,14 @@ impl Client {
         self.tm.on_request(f);
     }
 
+    pub(crate) fn on_drop<F: Fn() + Send + Sync + 'static>(&self, f: F) {
+        self.tm.on_drop(f);
+    }
+
+    pub(crate) fn has_transport_failure(&self) -> bool {
+        self.tm.has_failed()
+    }
+
     /// Sends a REGISTER request.
     /// Handles 401 auth challenges automatically.
     /// Returns (response_code, reason).

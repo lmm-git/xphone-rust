@@ -112,6 +112,7 @@ impl TcpConn {
     /// Connects to the given SIP server over TCP.
     pub fn connect(server_addr: SocketAddr, timeout: Duration) -> io::Result<Self> {
         let stream = TcpStream::connect_timeout(&server_addr, timeout)?;
+        stream.set_write_timeout(Some(timeout))?;
         let local = stream.local_addr()?;
         let writer = stream.try_clone()?;
         Ok(Self {
@@ -179,6 +180,7 @@ impl TlsConn {
     ) -> io::Result<Self> {
         tracing::trace!(server_addr = %server_addr, "TEST");
         let tcp = TcpStream::connect_timeout(&server_addr, timeout)?;
+        tcp.set_write_timeout(Some(timeout))?;
         let local = tcp.local_addr()?;
 
         let rustls_config = build_rustls_config(tls_config)?;
