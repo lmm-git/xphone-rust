@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use tracing::{debug, warn};
 
@@ -26,12 +26,24 @@ struct Inner {
     stopped: bool,
 }
 
+struct Connection {
+    socket: Option<Box<dyn SipConnection>>,
+    advertised_addr: SocketAddr,
+}
+
+impl Connection {
+    fn socket(&self) -> Result<&dyn SipConnection> {
+        self.socket
+            .as_deref()
+            .ok_or_else(|| Error::Other("sip: socket unavailable".into()))
+    }
+}
+
 /// Manages SIP client transactions.
 /// Dispatches incoming responses to the correct pending transaction by Via branch,
 /// and incoming requests to the OnRequest callback.
 pub struct TransactionManager {
-    conn: Arc<dyn SipConnection>,
-    local_addr: SocketAddr,
+    conn: Arc<RwLock<Connection>>,
     inner: Arc<Mutex<Inner>>,
     /// Transport name for Via headers (UDP, TCP, TLS).
     transport_name: String,
@@ -47,10 +59,18 @@ impl TransactionManager {
     /// Creates a new TransactionManager and starts its read loop.
     pub fn new(conn: Box<dyn SipConnection>) -> Self {
         let local_addr = conn.local_addr().expect("failed to get local addr");
-        let transport_name = conn.transport_name().to_string();
+        Self::with_advertised_addr(conn, local_addr)
+    }
 
-        // Wrap in Arc so both read loop and write path share the connection.
-        let conn: Arc<dyn SipConnection> = Arc::from(conn);
+    pub(crate) fn with_advertised_addr(
+        socket: Box<dyn SipConnection>,
+        advertised_addr: SocketAddr,
+    ) -> Self {
+        let transport_name = socket.transport_name().to_string();
+        let conn = Arc::new(RwLock::new(Connection {
+            socket: Some(socket),
+            advertised_addr,
+        }));
 
         let inner = Arc::new(Mutex::new(Inner {
             pending: HashMap::new(),
@@ -71,7 +91,6 @@ impl TransactionManager {
 
         Self {
             conn,
-            local_addr,
             inner,
             transport_name,
             nat: std::sync::atomic::AtomicBool::new(false),
@@ -79,6 +98,25 @@ impl TransactionManager {
             done_rx,
             thread: Mutex::new(Some(thread)),
         }
+    }
+
+    pub(crate) fn advertised_addr(&self) -> SocketAddr {
+        self.conn.read().advertised_addr
+    }
+
+    pub(crate) fn replace_socket(
+        &self,
+        open: impl FnOnce() -> Result<(Box<dyn SipConnection>, SocketAddr)>,
+    ) -> Result<()> {
+        let mut conn = self.conn.write();
+        // Release the old socket first so a fixed UDP port can be rebound.
+        conn.socket.take();
+        let (socket, advertised_addr) = open()?;
+        *conn = Connection {
+            socket: Some(socket),
+            advertised_addr,
+        };
+        Ok(())
     }
 
     /// Returns the transport name (UDP, TCP, TLS) for Via header construction.
@@ -119,6 +157,9 @@ impl TransactionManager {
             }
         }
 
+        let conn = self.conn.read();
+        let socket = conn.socket()?;
+
         // Generate branch and set Via if not present.
         let mut branch = req.via_branch().to_string();
         if branch.is_empty() {
@@ -131,9 +172,12 @@ impl TransactionManager {
             } else {
                 ""
             };
+            let local_addr = socket
+                .local_addr()
+                .map_err(|e| Error::Other(format!("sip: local addr: {e}")))?;
             let via = format!(
                 "SIP/2.0/{} {};branch={}{}",
-                self.transport_name, self.local_addr, branch, rport
+                self.transport_name, local_addr, branch, rport
             );
             req.set_header("Via", &via);
         }
@@ -153,9 +197,12 @@ impl TransactionManager {
         };
 
         // Send the request.
-        self.conn
-            .send(&req.to_bytes(), dst)
-            .map_err(|e| Error::Other(format!("sip: send: {}", e)))?;
+        let result = socket.send(&req.to_bytes(), dst);
+        drop(conn);
+        if let Err(e) = result {
+            self.remove_tx(&branch);
+            return Err(Error::Other(format!("sip: send: {e}")));
+        }
 
         // Wait for first response, timeout, or stop.
         crossbeam_channel::select! {
@@ -221,6 +268,8 @@ impl TransactionManager {
     /// Sends raw data (e.g., keepalive) without transaction tracking.
     pub fn send_raw(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
         self.conn
+            .read()
+            .socket()?
             .send(data, dst)
             .map_err(|e| Error::Other(format!("sip: send_raw: {}", e)))
     }
@@ -249,16 +298,25 @@ impl Drop for TransactionManager {
 }
 
 /// Read loop runs on a dedicated thread.
-fn read_loop(conn: Arc<dyn SipConnection>, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
+fn read_loop(conn: Arc<RwLock<Connection>>, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
     loop {
         // Check if stopped (channel closed).
         if done_rx.try_recv().is_ok() || done_rx.is_empty() && inner.lock().stopped {
             return;
         }
 
-        let (data, addr) = match conn.receive(Duration::from_millis(500)) {
-            Ok(pair) => pair,
-            Err(_) => continue, // timeout or error — loop again
+        let received = conn
+            .read()
+            .socket
+            .as_ref()
+            .map(|socket| socket.receive(Duration::from_millis(500)));
+        let (data, addr) = match received {
+            Some(Ok(pair)) => pair,
+            Some(Err(_)) => continue, // timeout or error — loop again
+            None => {
+                let _ = done_rx.recv_timeout(Duration::from_millis(10));
+                continue;
+            }
         };
 
         debug!(len = data.len(), from = %addr, "SIP recv raw packet");
