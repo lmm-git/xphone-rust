@@ -101,6 +101,28 @@ pub struct Client {
 }
 
 impl Client {
+    /// TLS-configured accounts use SIPS URIs so proxies retain TLS on later hops.
+    pub(crate) fn uri_scheme(&self) -> &'static str {
+        if self.cfg.transport.eq_ignore_ascii_case("tls") {
+            "sips"
+        } else {
+            "sip"
+        }
+    }
+
+    fn enforce_uri_scheme(&self, uri: &str) -> Result<String> {
+        if uri.starts_with("sips:") {
+            if self.uri_scheme() != "sips" {
+                return Err(Error::Other("SIPS target requires TLS transport".into()));
+            }
+            Ok(uri.to_string())
+        } else if let Some(rest) = uri.strip_prefix("sip:") {
+            Ok(format!("{}:{rest}", self.uri_scheme()))
+        } else {
+            Err(Error::Other("SIP target must be a SIP URI".into()))
+        }
+    }
+
     /// Creates a new SIP client, binding or connecting based on transport.
     pub fn new(cfg: ClientConfig) -> Result<Self> {
         let (socket, advertised_addr) = Self::open_socket(&cfg)?;
@@ -243,7 +265,7 @@ impl Client {
     }
 
     fn register(&self, timeout: Duration) -> Result<(u16, String)> {
-        let request_uri = format!("sip:{}", self.cfg.domain);
+        let request_uri = format!("{}:{}", self.uri_scheme(), self.cfg.domain);
         let mut req = self.build_request("REGISTER", &request_uri, None);
 
         let dest = self.outbound_dest();
@@ -287,7 +309,7 @@ impl Client {
             return Err(Error::Other("sip: client closed".into()));
         }
 
-        let request_uri = format!("sip:{}", self.cfg.domain);
+        let request_uri = format!("{}:{}", self.uri_scheme(), self.cfg.domain);
         let mut extra = HashMap::new();
         extra.insert("Expires".to_string(), "0".to_string());
         let mut req = self.build_request("REGISTER", &request_uri, Some(&extra));
@@ -417,7 +439,7 @@ impl Client {
         auth_override: Option<&Credentials>,
         cancellation: Option<&DialCancellation>,
     ) -> Result<InviteResult> {
-        let mut current_target = target_uri.to_string();
+        let mut current_target = self.enforce_uri_scheme(target_uri)?;
         let mut redirects: u8 = 0;
 
         loop {
@@ -440,6 +462,11 @@ impl Client {
             )? {
                 ConsumeResult::Success(result) => return Ok(*result),
                 ConsumeResult::Redirect(new_target) => {
+                    if self.uri_scheme() == "sips" && !new_target.starts_with("sips:") {
+                        return Err(Error::Other(
+                            "SIPS redirect attempted to downgrade to SIP".into(),
+                        ));
+                    }
                     redirects += 1;
                     if redirects >= MAX_REDIRECTS {
                         return Err(Error::Other(format!(
@@ -465,6 +492,9 @@ impl Client {
     ) -> Result<ConsumeResult> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
+        }
+        if target_uri.starts_with("sips:") && self.uri_scheme() != "sips" {
+            return Err(Error::Other("SIPS target requires TLS transport".into()));
         }
 
         let mut req = self.build_invite_request(target_uri, sdp, extra_headers);
@@ -636,6 +666,8 @@ impl Client {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
+        let normalized_uri = self.enforce_uri_scheme(subscribe_uri)?;
+        let subscribe_uri = normalized_uri.as_str();
 
         let mut req = self.build_request("SUBSCRIBE", subscribe_uri, Some(extra_headers));
         // Override To header to target the subscription URI.
@@ -694,6 +726,8 @@ impl Client {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
+        let normalized_uri = self.enforce_uri_scheme(target_uri)?;
+        let target_uri = normalized_uri.as_str();
 
         let extra: HashMap<String, String> = [("Content-Type".into(), content_type.into())].into();
         let mut req = self.build_request("MESSAGE", target_uri, Some(&extra));
@@ -824,14 +858,20 @@ impl Client {
         msg.set_header(
             "From",
             &format!(
-                "<sip:{}@{}>;tag={}",
-                self.cfg.username, self.cfg.domain, from_tag
+                "<{}:{}@{}>;tag={}",
+                self.uri_scheme(),
+                self.cfg.username,
+                self.cfg.domain,
+                from_tag
             ),
         );
         msg.set_header("To", &format!("<{}>", target_uri));
         msg.set_header("Call-ID", &invite_call_id);
         msg.set_header("CSeq", &format!("{} INVITE", seq));
-        msg.set_header("Contact", &format!("<sip:{}@{}>", self.cfg.username, local));
+        msg.set_header(
+            "Contact",
+            &format!("<{}:{}@{}>", self.uri_scheme(), self.cfg.username, local),
+        );
         msg.set_header("Max-Forwards", "70");
         msg.set_header("User-Agent", &self.cfg.user_agent);
         msg.set_header("Content-Type", "application/sdp");
@@ -910,17 +950,28 @@ impl Client {
         msg.set_header(
             "From",
             &format!(
-                "<sip:{}@{}>;tag={}",
-                self.cfg.username, self.cfg.domain, from_tag
+                "<{}:{}@{}>;tag={}",
+                self.uri_scheme(),
+                self.cfg.username,
+                self.cfg.domain,
+                from_tag
             ),
         );
         msg.set_header(
             "To",
-            &format!("<sip:{}@{}>", self.cfg.username, self.cfg.domain),
+            &format!(
+                "<{}:{}@{}>",
+                self.uri_scheme(),
+                self.cfg.username,
+                self.cfg.domain
+            ),
         );
         msg.set_header("Call-ID", &self.call_id);
         msg.set_header("CSeq", &format!("{} {}", seq, method));
-        msg.set_header("Contact", &format!("<sip:{}@{}>", self.cfg.username, local));
+        msg.set_header(
+            "Contact",
+            &format!("<{}:{}@{}>", self.uri_scheme(), self.cfg.username, local),
+        );
         msg.set_header("Max-Forwards", "70");
         msg.set_header("User-Agent", &self.cfg.user_agent);
 

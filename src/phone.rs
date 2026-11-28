@@ -160,6 +160,7 @@ impl Phone {
         let incoming_ip = effective_ip.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
         let rtp_port_max = self.cfg.rtp_port_max;
+        let require_srtp = self.cfg.srtp;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
             handle_dialog_incoming(
                 &inner_clone,
@@ -170,6 +171,7 @@ impl Phone {
                 &incoming_ip,
                 rtp_port_min,
                 rtp_port_max,
+                require_srtp,
             );
         }));
 
@@ -302,7 +304,6 @@ impl Phone {
             }
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
         };
-
         // Allocate RTP port and build SDP offer.
         // Precedence: DialOptions::rtp_address → Config::local_ip → STUN-mapped
         // advertised address → route-lookup heuristic.
@@ -422,6 +423,19 @@ impl Phone {
 
         let (call, responses) = match dial_result {
             Ok(result) => {
+                let secure_answer = secure_audio_sdp(&result.remote_sdp);
+                let invalid_video = opts.video
+                    && secure_answer.as_ref().is_some_and(|sess| {
+                        sess.video_media().is_some_and(|video| video.port > 0)
+                            && sess.supported_video_crypto().is_none()
+                    });
+                if self.cfg.srtp && (secure_answer.is_none() || invalid_video) {
+                    let _ = result.dialog.send_bye();
+                    return Err(Error::Sdp(
+                        "remote answer does not provide supported SRTP keying for active media"
+                            .into(),
+                    ));
+                }
                 // Production path: got a real dialog from SipUA.
                 // tr.dial() already consumed the 200 OK, so transition to Active.
                 let call = Call::new_outbound(result.dialog, opts);
@@ -429,6 +443,9 @@ impl Phone {
                 call.set_local_sdp(&local_sdp);
                 if let Some(ref key) = srtp_inline_key {
                     call.set_srtp(key);
+                }
+                if let Some(ref key) = video_srtp_inline_key {
+                    call.set_video_srtp(key);
                 }
                 if let Some(sock) = rtp_socket {
                     call.set_rtp_socket(sock);
@@ -445,8 +462,12 @@ impl Phone {
                 // Handle early media: if we got a 183 with SDP, set up media before
                 // the final 200 OK so the caller hears ringback/IVR prompts.
                 if let Some(ref early_sdp) = result.early_sdp {
-                    call.set_remote_sdp(early_sdp);
-                    call.simulate_response(183, "Session Progress");
+                    // A final answer can replace provisional SDES keys. Wait for
+                    // that answer before starting a protected media pipeline.
+                    if !self.cfg.srtp {
+                        call.set_remote_sdp(early_sdp);
+                        call.simulate_response(183, "Session Progress");
+                    }
                 }
 
                 if !result.remote_sdp.is_empty() {
@@ -456,6 +477,11 @@ impl Phone {
                 (call, Vec::new())
             }
             Err(e) if e.to_string().contains("not supported") => {
+                if self.cfg.srtp {
+                    return Err(Error::Sdp(
+                        "transport cannot supply an SRTP answer for verification".into(),
+                    ));
+                }
                 // Fallback path (MockTransport): use send_request + MockDialog.
                 let resp = tr.send_request("INVITE", None, opts.timeout)?;
                 let mut code = resp.status_code;
@@ -625,7 +651,12 @@ impl Phone {
         }
         let sub_mgr = self.get_sub_mgr()?;
 
-        let uri = format!("sip:{}@{}", extension, self.cfg.host);
+        let scheme = if self.cfg.transport.eq_ignore_ascii_case("tls") {
+            "sips"
+        } else {
+            "sip"
+        };
+        let uri = format!("{scheme}:{}@{}", extension, self.cfg.host);
         let ext = extension.to_string();
         let phone_inner = Arc::clone(&self.inner);
         let f = Arc::new(f);
@@ -906,7 +937,12 @@ fn handle_dialog_incoming(
     local_ip: &str,
     rtp_port_min: u16,
     rtp_port_max: u16,
+    require_srtp: bool,
 ) {
+    if require_srtp && secure_audio_sdp(remote_sdp).is_none() {
+        let _ = dlg.respond(488, "Not Acceptable Here", &[]);
+        return;
+    }
     // Check if this is a re-INVITE for an existing call (same Call-ID).
     let call_id = dlg.call_id();
     let existing_call = inner.lock().calls.get(&call_id).cloned();
@@ -934,24 +970,50 @@ fn handle_dialog_incoming(
     let parsed_sdp = crate::sdp::parse(remote_sdp).ok();
 
     // Only use SRTP if the remote actually offers RTP/SAVP with a supported suite.
-    let use_srtp = parsed_sdp.as_ref().is_some_and(|sess| {
-        sess.is_srtp()
-            && sess
-                .first_crypto()
-                .is_some_and(|c| c.suite == crate::srtp::SUPPORTED_SUITE)
-    });
+    let use_srtp = secure_audio_sdp(remote_sdp).is_some();
 
-    // Create an inbound call with the real dialog.
-    let call = Call::new_inbound(dlg);
-    call.set_local_media(local_ip, actual_port);
-    if use_srtp {
+    // Generate independent keys before constructing the call so failure can
+    // produce a SIP response without leaving a partially initialized call.
+    let local_audio_key = if use_srtp {
         match crate::srtp::generate_keying_material() {
-            Ok((_material, encoded)) => call.set_srtp(&encoded),
+            Ok((_, encoded)) => Some(encoded),
             Err(e) => {
-                tracing::error!("failed to generate SRTP keying material: {}", e);
+                tracing::error!("failed to generate audio SRTP keying material: {e}");
+                if let Err(send_error) = dlg.respond(500, "Server Internal Error", &[]) {
+                    tracing::error!("failed to send 500 response: {send_error}");
+                }
                 return;
             }
         }
+    } else {
+        None
+    };
+    let secure_video = use_srtp
+        && parsed_sdp
+            .as_ref()
+            .is_some_and(|sess| sess.supported_video_crypto().is_some());
+    let local_video_key = if secure_video {
+        match crate::srtp::generate_keying_material() {
+            Ok((_, encoded)) => Some(encoded),
+            Err(e) => {
+                tracing::error!("failed to generate video SRTP keying material: {e}");
+                if let Err(send_error) = dlg.respond(500, "Server Internal Error", &[]) {
+                    tracing::error!("failed to send 500 response: {send_error}");
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let call = Call::new_inbound(dlg);
+    call.set_local_media(local_ip, actual_port);
+    if let Some(ref key) = local_audio_key {
+        call.set_srtp(key);
+    }
+    if let Some(ref key) = local_video_key {
+        call.set_video_srtp(key);
     }
     if let Some(sock) = rtp_socket {
         call.set_rtp_socket(sock);
@@ -959,7 +1021,7 @@ fn handle_dialog_incoming(
 
     // Allocate video RTP socket if remote SDP offers video.
     if let Some(ref sess) = parsed_sdp {
-        if sess.has_video() {
+        if sess.has_video() && (!use_srtp || secure_video) {
             if let Ok((vsock, vport)) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
                 call.set_video_rtp_port(vport as i32);
                 call.set_video_rtp_socket(vsock);
@@ -984,6 +1046,12 @@ fn handle_dialog_incoming(
     for f in &incoming_fns {
         f(Arc::clone(&call));
     }
+}
+
+fn secure_audio_sdp(raw: &str) -> Option<crate::sdp::Session> {
+    let session = crate::sdp::parse(raw).ok()?;
+    session.supported_audio_crypto()?;
+    Some(session)
 }
 
 /// Handles a mid-dialog re-INVITE for an existing call (e.g., video upgrade, hold/resume).
@@ -1058,6 +1126,45 @@ mod tests {
             nat_keepalive_interval: None,
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn secure_audio_sdp_requires_supported_usable_key() {
+        let (_, key) = crate::srtp::generate_keying_material().unwrap();
+        let valid = crate::sdp::build_offer_srtp("127.0.0.1", 5004, &[0], "sendrecv", &key);
+        assert!(secure_audio_sdp(&valid).is_some());
+        assert!(secure_audio_sdp(&crate::sdp::build_offer(
+            "127.0.0.1",
+            5004,
+            &[0],
+            "sendrecv"
+        ))
+        .is_none());
+        assert!(
+            secure_audio_sdp(&valid.replace(crate::srtp::SUPPORTED_SUITE, "UNSUPPORTED")).is_none()
+        );
+        assert!(secure_audio_sdp(&valid.replace(&key, "badkey")).is_none());
+        assert!(secure_audio_sdp(&valid.replace("a=crypto:1 ", "a=crypto:2 ")).is_none());
+    }
+
+    #[test]
+    fn secure_incoming_rejects_plain_audio_before_ringing() {
+        let phone = Phone::new(test_cfg());
+        let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+        let offer = crate::sdp::build_offer("127.0.0.1", 5004, &[0], "sendrecv");
+        handle_dialog_incoming(
+            &phone.inner,
+            dlg.clone(),
+            "sip:alice@pbx",
+            "sip:bob@pbx",
+            &offer,
+            "127.0.0.1",
+            0,
+            0,
+            true,
+        );
+        assert_eq!(dlg.last_response_code(), 488);
+        assert!(phone.inner.lock().calls.is_empty());
     }
 
     #[test]

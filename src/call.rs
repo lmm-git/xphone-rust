@@ -227,6 +227,9 @@ struct CallInner {
     srtp_local_key: String,
     /// Remote SRTP keying material (base64 inline key).
     srtp_remote_key: String,
+    /// Separate SDES keying for the video stream.
+    video_srtp_local_key: String,
+    video_srtp_remote_key: String,
 
     rtp_socket: Option<Arc<UdpSocket>>,
     media_streams: Vec<media::MediaStream>,
@@ -234,6 +237,7 @@ struct CallInner {
 
     video_muted: bool,
     video_codec: Option<VideoCodec>,
+    video_payload_type: u8,
     video_rtp_port: i32,
     video_rtp_socket: Option<Arc<UdpSocket>>,
     video_rtcp_socket: Option<Arc<UdpSocket>>,
@@ -294,11 +298,14 @@ impl Call {
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
+                video_srtp_local_key: String::new(),
+                video_srtp_remote_key: String::new(),
                 rtp_socket: None,
                 media_streams: Vec::new(),
                 media_shared: None,
                 video_muted: false,
                 video_codec: None,
+                video_payload_type: 96,
                 video_rtp_port: 0,
                 video_rtp_socket: None,
                 video_rtcp_socket: None,
@@ -349,11 +356,14 @@ impl Call {
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
+                video_srtp_local_key: String::new(),
+                video_srtp_remote_key: String::new(),
                 rtp_socket: None,
                 media_streams: Vec::new(),
                 media_shared: None,
                 video_muted: false,
                 video_codec: None,
+                video_payload_type: 96,
                 video_rtp_port: 0,
                 video_rtp_socket: None,
                 video_rtcp_socket: None,
@@ -578,27 +588,47 @@ impl Call {
             .unwrap_or(&[]);
         let prefs = Self::resolve_codec_prefs(inner);
 
-        // If remote offers video and we have a video socket, build audio+video answer.
-        if remote.has_video() && inner.video_rtp_socket.is_some() {
+        // Answer video only when its own SDES key is usable (for SRTP calls).
+        if remote.has_video()
+            && inner.video_rtp_socket.is_some()
+            && (!inner.srtp_enabled
+                || (!inner.video_srtp_local_key.is_empty()
+                    && !inner.video_srtp_remote_key.is_empty()))
+        {
             let empty_rtpmap: Vec<(i32, String)> = Vec::new();
             let remote_video_rtpmap = remote
                 .video_media()
                 .map(|vm| vm.rtpmap.as_slice())
                 .unwrap_or(&empty_rtpmap);
             let local_video = &[VideoCodec::H264, VideoCodec::VP8];
-            return sdp::build_answer_video(
-                &inner.local_ip,
-                inner.rtp_port,
-                prefs,
-                remote_codecs,
-                inner.video_rtp_port,
-                local_video,
-                remote_video_rtpmap,
-                direction,
-            );
+            return if inner.srtp_enabled {
+                sdp::build_answer_video_srtp(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    remote_codecs,
+                    inner.video_rtp_port,
+                    local_video,
+                    remote_video_rtpmap,
+                    direction,
+                    &inner.srtp_local_key,
+                    &inner.video_srtp_local_key,
+                )
+            } else {
+                sdp::build_answer_video(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    remote_codecs,
+                    inner.video_rtp_port,
+                    local_video,
+                    remote_video_rtpmap,
+                    direction,
+                )
+            };
         }
 
-        if inner.srtp_enabled && !inner.srtp_local_key.is_empty() {
+        let mut answer = if inner.srtp_enabled && !inner.srtp_local_key.is_empty() {
             sdp::build_answer_srtp(
                 &inner.local_ip,
                 inner.rtp_port,
@@ -615,7 +645,15 @@ impl Call {
                 remote_codecs,
                 direction,
             )
+        };
+        if remote.video_media().is_some() {
+            answer.push_str(if inner.srtp_enabled {
+                "m=video 0 RTP/SAVP 0\r\n"
+            } else {
+                "m=video 0 RTP/AVP 0\r\n"
+            });
         }
+        answer
     }
 
     fn negotiate_codec(inner: &mut CallInner, sess: &sdp::Session) {
@@ -656,6 +694,13 @@ impl Call {
             if vm.port > 0 {
                 if let Some(vc) = sess.video_codec() {
                     inner.video_codec = Some(vc);
+                    if let Some((pt, _)) = vm
+                        .rtpmap
+                        .iter()
+                        .find(|(_, name)| VideoCodec::from_rtpmap_name(name) == Some(vc))
+                    {
+                        inner.video_payload_type = *pt as u8;
+                    }
                 }
             }
         }
@@ -767,12 +812,25 @@ impl Call {
                 info!(state = ?inner.state, "Call accept rejected — not in Ringing state");
                 return Err(Error::InvalidState);
             }
+            if inner.srtp_enabled
+                && (inner.srtp_local_key.is_empty() || inner.srtp_remote_key.is_empty())
+            {
+                return Err(Error::Sdp("SRTP keying is incomplete".into()));
+            }
 
             if !inner.remote_sdp.is_empty() {
                 if let Ok(sess) = sdp::parse(&inner.remote_sdp) {
                     Self::negotiate_codec(&mut inner, &sess);
                     inner.local_sdp = Self::build_answer_sdp(&mut inner, &sess, sdp::DIR_SEND_RECV);
                     Self::set_remote_endpoint(&mut inner, &sess);
+                    if sdp::parse(&inner.local_sdp)
+                        .ok()
+                        .and_then(|answer| answer.video_media().map(|video| video.port == 0))
+                        .unwrap_or(false)
+                    {
+                        inner.video_codec = None;
+                        inner.video_remote_port = 0;
+                    }
                 } else {
                     inner.local_sdp = Self::build_local_sdp(&mut inner, sdp::DIR_SEND_RECV);
                 }
@@ -981,6 +1039,11 @@ impl Call {
         // Allocate video socket outside the lock.
         let (vsock, vport) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
             .map_err(|e| Error::Other(format!("failed to allocate video port: {e}")))?;
+        let video_key = if self.inner.lock().srtp_enabled {
+            Some(crate::srtp::generate_keying_material()?.1)
+        } else {
+            None
+        };
 
         let local_sdp;
         {
@@ -998,15 +1061,31 @@ impl Call {
             if inner.local_ip.is_empty() {
                 inner.local_ip = "127.0.0.1".into();
             }
+            if let Some(ref key) = video_key {
+                inner.video_srtp_local_key = key.clone();
+            }
             let prefs = Self::resolve_codec_prefs(&inner);
-            inner.local_sdp = sdp::build_offer_video(
-                &inner.local_ip,
-                inner.rtp_port,
-                prefs,
-                inner.video_rtp_port,
-                video_codecs,
-                sdp::DIR_SEND_RECV,
-            );
+            inner.local_sdp = if let Some(ref video_key) = video_key {
+                sdp::build_offer_video_srtp(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    inner.video_rtp_port,
+                    video_codecs,
+                    sdp::DIR_SEND_RECV,
+                    &inner.srtp_local_key,
+                    video_key,
+                )
+            } else {
+                sdp::build_offer_video(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    inner.video_rtp_port,
+                    video_codecs,
+                    sdp::DIR_SEND_RECV,
+                )
+            };
             local_sdp = inner.local_sdp.clone();
         }
 
@@ -1534,6 +1613,43 @@ impl Call {
             }
         };
 
+        let (secure_call, current_audio_key, current_video_key) = {
+            let inner = self.inner.lock();
+            (
+                inner.srtp_enabled,
+                inner.srtp_remote_key.clone(),
+                inner.video_srtp_remote_key.clone(),
+            )
+        };
+        if secure_call {
+            if sess
+                .supported_audio_crypto()
+                .is_none_or(|crypto| crypto.key_params != current_audio_key)
+            {
+                let _ = reinvite_dlg.respond(488, "Not Acceptable Here", &[]);
+                return;
+            }
+            if self.has_video()
+                && sess
+                    .supported_video_crypto()
+                    .is_some_and(|crypto| crypto.key_params != current_video_key)
+            {
+                let _ = reinvite_dlg.respond(488, "Not Acceptable Here", &[]);
+                return;
+            }
+            if sess.video_media().is_some_and(|video| video.port > 0)
+                && sess.supported_video_crypto().is_none()
+            {
+                // The audio session can continue; reject only the new video line.
+                if self.has_video() {
+                    let _ = reinvite_dlg.respond(488, "Not Acceptable Here", &[]);
+                } else {
+                    self.reject_video_internal(reinvite_dlg, &sess, remote_sdp);
+                }
+                return;
+            }
+        }
+
         // Check for video downgrade (m=video 0).
         if let Some(vm) = sess.video_media() {
             if vm.port == 0 && self.has_video() {
@@ -1549,6 +1665,21 @@ impl Call {
             // Audio-only re-INVITE — delegate to hold/resume handling.
             self.simulate_reinvite_parsed(&sess, remote_sdp);
             return;
+        }
+
+        let needs_video_key = {
+            let inner = self.inner.lock();
+            inner.srtp_enabled && inner.video_srtp_local_key.is_empty()
+        };
+        if needs_video_key {
+            match crate::srtp::generate_keying_material() {
+                Ok((_, key)) => self.set_video_srtp(&key),
+                Err(e) => {
+                    tracing::error!("failed to generate video SRTP key: {e}");
+                    let _ = reinvite_dlg.respond(500, "Server Internal Error", &[]);
+                    return;
+                }
+            }
         }
 
         // Video upgrade request — check if app registered a handler.
@@ -1628,6 +1759,13 @@ impl Call {
             inner.remote_sdp = remote_sdp.to_string();
             Self::set_remote_endpoint(&mut inner, sess);
             Self::negotiate_codec(&mut inner, sess);
+            if let Some(crypto) = sess.supported_video_crypto() {
+                inner.video_srtp_remote_key = crypto.key_params.clone();
+            }
+            if inner.srtp_enabled && inner.video_srtp_remote_key.is_empty() {
+                inner.video_codec = None;
+                inner.video_remote_port = 0;
+            }
 
             // Build SDP answer with video.
             inner.local_sdp = Self::build_answer_sdp(&mut inner, sess, sdp::DIR_SEND_RECV);
@@ -1698,15 +1836,30 @@ impl Call {
                 .audio_media()
                 .map(|m| m.codecs.as_slice())
                 .unwrap_or(&[]);
-            let mut answer = sdp::build_answer(
-                &inner.local_ip,
-                inner.rtp_port,
-                prefs,
-                remote_codecs,
-                sdp::DIR_SEND_RECV,
-            );
+            let mut answer = if inner.srtp_enabled {
+                sdp::build_answer_srtp(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    remote_codecs,
+                    sdp::DIR_SEND_RECV,
+                    &inner.srtp_local_key,
+                )
+            } else {
+                sdp::build_answer(
+                    &inner.local_ip,
+                    inner.rtp_port,
+                    prefs,
+                    remote_codecs,
+                    sdp::DIR_SEND_RECV,
+                )
+            };
             if sess.video_media().is_some() {
-                answer.push_str("m=video 0 RTP/AVP 0\r\n");
+                answer.push_str(if inner.srtp_enabled {
+                    "m=video 0 RTP/SAVP 0\r\n"
+                } else {
+                    "m=video 0 RTP/AVP 0\r\n"
+                });
             }
             inner.local_sdp = answer.clone();
             local_sdp = answer;
@@ -1787,15 +1940,14 @@ impl Call {
             Self::set_remote_endpoint(&mut inner, &sess);
             Self::negotiate_codec(&mut inner, &sess);
             // Extract remote SRTP key if present and suite is supported.
-            if sess.is_srtp() {
-                if let Some(crypto) = sess.first_crypto() {
-                    if crypto.suite == crate::srtp::SUPPORTED_SUITE {
-                        inner.srtp_remote_key = crypto.key_params.clone();
-                        inner.srtp_enabled = true;
-                    } else {
-                        tracing::warn!("remote offered unsupported SRTP suite: {}", crypto.suite);
-                    }
-                }
+            inner.srtp_remote_key.clear();
+            if let Some(crypto) = sess.supported_audio_crypto() {
+                inner.srtp_remote_key = crypto.key_params.clone();
+                inner.srtp_enabled = true;
+            }
+            inner.video_srtp_remote_key.clear();
+            if let Some(crypto) = sess.supported_video_crypto() {
+                inner.video_srtp_remote_key = crypto.key_params.clone();
             }
         }
     }
@@ -1832,6 +1984,11 @@ impl Call {
         inner.srtp_local_key = local_inline_key.to_string();
     }
 
+    /// Stores the independently generated local video SDES key.
+    pub(crate) fn set_video_srtp(&self, local_inline_key: &str) {
+        self.inner.lock().video_srtp_local_key = local_inline_key.to_string();
+    }
+
     /// Starts the media pipeline if an RTP socket is available and remote endpoint is known.
     fn start_media_pipeline(inner: &mut CallInner) {
         if !inner.media_streams.is_empty() {
@@ -1859,6 +2016,13 @@ impl Call {
         // Wire DTMF callbacks from Call into the media thread's shared state.
         // Combine internal + user callbacks into a single dispatcher.
         Self::sync_dtmf_to_media(inner, &shared);
+        // Never start plain media for a call that negotiated SRTP.
+        if inner.srtp_enabled
+            && (inner.srtp_local_key.is_empty() || inner.srtp_remote_key.is_empty())
+        {
+            tracing::error!("SRTP keying incomplete; media will not start");
+            return;
+        }
         // Create SRTP contexts if enabled and both keys are available.
         let (srtp_in, srtp_out) = if inner.srtp_enabled
             && !inner.srtp_local_key.is_empty()
@@ -1929,6 +2093,12 @@ impl Call {
 
     /// Starts the video media pipeline if video was negotiated and a video socket is available.
     fn start_video_pipeline(inner: &mut CallInner) {
+        if inner.srtp_enabled
+            && (inner.video_srtp_local_key.is_empty() || inner.video_srtp_remote_key.is_empty())
+        {
+            tracing::error!("video SRTP keying incomplete; video media will not start");
+            return;
+        }
         if inner.video_codec.is_none() || inner.video_rtp_socket.is_none() {
             return;
         }
@@ -1965,18 +2135,22 @@ impl Call {
             None
         };
 
-        let (video_srtp_in, video_srtp_out) = if inner.srtp_enabled
-            && !inner.srtp_local_key.is_empty()
-            && !inner.srtp_remote_key.is_empty()
-        {
-            let inbound = SrtpContext::from_sdes_inline(&inner.srtp_remote_key)
-                .map_err(|e| tracing::error!("Video SRTP inbound context failed: {}", e))
-                .ok();
-            let outbound =
-                SrtpContext::from_sdes_inline(&format!("inline:{}", inner.srtp_local_key))
-                    .map_err(|e| tracing::error!("Video SRTP outbound context failed: {}", e))
-                    .ok();
-            (inbound, outbound)
+        let (video_srtp_in, video_srtp_out) = if inner.srtp_enabled {
+            let inbound = match SrtpContext::from_sdes_inline(&inner.video_srtp_remote_key) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::error!("Video SRTP inbound context failed: {}", e);
+                    return;
+                }
+            };
+            let outbound = match SrtpContext::from_sdes_inline(&inner.video_srtp_local_key) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::error!("Video SRTP outbound context failed: {}", e);
+                    return;
+                }
+            };
+            (Some(inbound), Some(outbound))
         } else {
             (None, None)
         };
@@ -1987,10 +2161,7 @@ impl Call {
             rtcp_socket: video_rtcp_socket,
             rtcp_remote_addr: video_rtcp_addr,
             video_codec: inner.video_codec,
-            video_payload_type: inner
-                .video_codec
-                .map(|c| c.default_payload_type())
-                .unwrap_or(96),
+            video_payload_type: inner.video_payload_type,
         };
         let video_muted = Arc::new(std::sync::atomic::AtomicBool::new(inner.video_muted));
         let video_stream = media::start_video_media(
@@ -3694,6 +3865,116 @@ mod tests {
             a=rtpmap:96 H264/90000\r\n\
             a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\n\
             a=sendrecv\r\n"
+    }
+
+    #[test]
+    fn secure_video_answer_uses_separate_media_keys() {
+        let (_, remote_audio) = crate::srtp::generate_keying_material().unwrap();
+        let (_, remote_video) = crate::srtp::generate_keying_material().unwrap();
+        let (_, local_audio) = crate::srtp::generate_keying_material().unwrap();
+        let (_, local_video) = crate::srtp::generate_keying_material().unwrap();
+        let offer = sdp::build_offer_video_srtp(
+            "127.0.0.1",
+            5000,
+            &[0],
+            5002,
+            &[VideoCodec::H264],
+            sdp::DIR_SEND_RECV,
+            &remote_audio,
+            &remote_video,
+        );
+        let dlg = mock_dlg();
+        let call = Call::new_inbound(dlg.clone());
+        call.set_local_media("127.0.0.1", 6000);
+        call.set_video_rtp_port(6002);
+        call.set_video_rtp_socket(UdpSocket::bind("127.0.0.1:0").unwrap());
+        call.set_srtp(&local_audio);
+        call.set_video_srtp(&local_video);
+        call.set_remote_sdp(&offer);
+        call.accept().unwrap();
+
+        let answer = sdp::parse(&String::from_utf8(dlg.last_response_body()).unwrap()).unwrap();
+        assert_eq!(
+            answer.supported_audio_crypto().unwrap().key_params,
+            format!("inline:{local_audio}")
+        );
+        assert_eq!(
+            answer.supported_video_crypto().unwrap().key_params,
+            format!("inline:{local_video}")
+        );
+        let inner = call.inner.lock();
+        assert_eq!(inner.srtp_remote_key, format!("inline:{remote_audio}"));
+        assert_eq!(
+            inner.video_srtp_remote_key,
+            format!("inline:{remote_video}")
+        );
+    }
+
+    #[test]
+    fn secure_video_upgrade_without_video_key_rejects_only_video() {
+        let (_, remote_audio) = crate::srtp::generate_keying_material().unwrap();
+        let (_, local_audio) = crate::srtp::generate_keying_material().unwrap();
+        let audio_offer =
+            sdp::build_offer_srtp("127.0.0.1", 5000, &[0], sdp::DIR_SEND_RECV, &remote_audio);
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("127.0.0.1", 6000);
+        call.set_srtp(&local_audio);
+        call.set_remote_sdp(&audio_offer);
+        call.accept().unwrap();
+
+        let mut upgrade = audio_offer;
+        upgrade.push_str("m=video 5002 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n");
+        let reinvite = mock_dlg();
+        let dialog: Arc<dyn Dialog> = reinvite.clone();
+        call.handle_reinvite(&dialog, &upgrade, 0, 0);
+        assert_eq!(reinvite.last_response_code(), 200);
+        assert!(String::from_utf8(reinvite.last_response_body())
+            .unwrap()
+            .contains("m=video 0 RTP/SAVP"));
+        assert_eq!(call.state(), CallState::Active);
+    }
+
+    #[test]
+    fn secure_video_upgrade_accepts_video_with_its_own_key() {
+        let (_, remote_audio) = crate::srtp::generate_keying_material().unwrap();
+        let (_, remote_video) = crate::srtp::generate_keying_material().unwrap();
+        let (_, local_audio) = crate::srtp::generate_keying_material().unwrap();
+        let audio_offer =
+            sdp::build_offer_srtp("127.0.0.1", 5000, &[0], sdp::DIR_SEND_RECV, &remote_audio);
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("127.0.0.1", 6000);
+        call.set_srtp(&local_audio);
+        call.set_remote_sdp(&audio_offer);
+        call.accept().unwrap();
+        call.on_video_request(|request| request.accept());
+
+        let upgrade = sdp::build_offer_video_srtp(
+            "127.0.0.1",
+            5000,
+            &[0],
+            5002,
+            &[VideoCodec::H264],
+            sdp::DIR_SEND_RECV,
+            &remote_audio,
+            &remote_video,
+        );
+        let reinvite = mock_dlg();
+        let dialog: Arc<dyn Dialog> = reinvite.clone();
+        call.handle_reinvite(&dialog, &upgrade, 0, 0);
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(reinvite.last_response_code(), 200);
+        let answer =
+            sdp::parse(&String::from_utf8(reinvite.last_response_body()).unwrap()).unwrap();
+        assert!(answer.supported_video_crypto().is_some());
+        assert_ne!(
+            answer.supported_audio_crypto().unwrap().key_params,
+            answer.supported_video_crypto().unwrap().key_params,
+        );
+        assert_eq!(
+            call.inner.lock().video_srtp_remote_key,
+            format!("inline:{remote_video}")
+        );
     }
 
     #[test]

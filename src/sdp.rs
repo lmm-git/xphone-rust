@@ -67,6 +67,15 @@ pub struct CryptoAttr {
 }
 
 impl Session {
+    /// Returns a usable SDES key for the first audio stream using our SRTP suite.
+    pub(crate) fn supported_audio_crypto(&self) -> Option<&CryptoAttr> {
+        self.audio_media()?.supported_crypto()
+    }
+
+    /// Returns a usable SDES key for an active video stream.
+    pub(crate) fn supported_video_crypto(&self) -> Option<&CryptoAttr> {
+        self.video_media()?.supported_crypto()
+    }
     /// Returns the first payload type from the first m= line, or -1 if none.
     pub fn first_codec(&self) -> i32 {
         self.media
@@ -125,6 +134,19 @@ impl Session {
             .iter()
             .find(|(p, _)| *p == pt)
             .and_then(|(_, name)| VideoCodec::from_rtpmap_name(name))
+    }
+}
+
+impl MediaDesc {
+    fn supported_crypto(&self) -> Option<&CryptoAttr> {
+        if self.profile != "RTP/SAVP" || self.port == 0 {
+            return None;
+        }
+        self.crypto.iter().find(|crypto| {
+            crypto.tag == 1
+                && crypto.suite == crate::srtp::SUPPORTED_SUITE
+                && crate::srtp::SrtpContext::from_sdes_inline(&crypto.key_params).is_ok()
+        })
     }
 }
 
@@ -596,6 +618,58 @@ pub fn build_answer_video(
     remote_video_rtpmap: &[(i32, String)],
     direction: &str,
 ) -> String {
+    build_answer_video_inner(
+        ip,
+        audio_port,
+        local_audio_prefs,
+        remote_audio,
+        video_port,
+        local_video,
+        remote_video_rtpmap,
+        direction,
+        None,
+    )
+}
+
+/// Creates an audio + video SDES-SRTP answer with separate keys per stream.
+#[allow(clippy::too_many_arguments)]
+pub fn build_answer_video_srtp(
+    ip: &str,
+    audio_port: i32,
+    local_audio_prefs: &[i32],
+    remote_audio: &[i32],
+    video_port: i32,
+    local_video: &[VideoCodec],
+    remote_video_rtpmap: &[(i32, String)],
+    direction: &str,
+    audio_crypto_key: &str,
+    video_crypto_key: &str,
+) -> String {
+    build_answer_video_inner(
+        ip,
+        audio_port,
+        local_audio_prefs,
+        remote_audio,
+        video_port,
+        local_video,
+        remote_video_rtpmap,
+        direction,
+        Some((audio_crypto_key, video_crypto_key)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_answer_video_inner(
+    ip: &str,
+    audio_port: i32,
+    local_audio_prefs: &[i32],
+    remote_audio: &[i32],
+    video_port: i32,
+    local_video: &[VideoCodec],
+    remote_video_rtpmap: &[(i32, String)],
+    direction: &str,
+    crypto_keys: Option<(&str, &str)>,
+) -> String {
     // Audio: intersect as usual.
     let mut audio_common = intersect_codecs(local_audio_prefs, remote_audio);
     if audio_common.is_empty() {
@@ -612,17 +686,26 @@ pub fn build_answer_video(
                 .map(|(pt, _)| (*vc, *pt as u8))
         })
         .collect();
-    let mut sdp = build_offer(ip, audio_port, &audio_common, direction);
+    let mut sdp = if let Some((audio_key, _)) = crypto_keys {
+        build_offer_srtp(ip, audio_port, &audio_common, direction, audio_key)
+    } else {
+        build_offer(ip, audio_port, &audio_common, direction)
+    };
+    let profile = if crypto_keys.is_some() {
+        "RTP/SAVP"
+    } else {
+        "RTP/AVP"
+    };
     if video_common.is_empty() {
         // RFC 3264: reject unsupported media with port 0.
-        sdp.push_str("m=video 0 RTP/AVP 0\r\n");
+        sdp.push_str(&format!("m=video 0 {profile} 0\r\n"));
     } else {
         sdp.push_str(&build_video_section(
             video_port,
             &video_common,
             direction,
-            "RTP/AVP",
-            None,
+            profile,
+            crypto_keys.map(|(_, video_key)| video_key),
             None,
         ));
     }

@@ -512,6 +512,11 @@ let phone = Phone::new(
 
 See [docs.rs](https://docs.rs/xphone) for all options.
 
+`srtp: true` requires a supported SDES-SRTP audio answer or offer and rejects
+calls without usable remote keying. Audio and video use separate SDES keys.
+Use TLS signaling for SDES so the inline media keys are protected in transit;
+TLS accounts use `sips:` URIs for registration, calls, and contacts.
+
 ---
 
 ## RTP Port Range

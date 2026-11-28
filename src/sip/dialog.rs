@@ -16,11 +16,13 @@ const SIP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Normalizes a transfer target to a SIP URI.
 /// "1003" → "sip:1003@domain", "sip:1003@pbx" → "sip:1003@pbx"
-fn normalize_sip_uri(target: &str, domain: &str) -> String {
-    if target.starts_with("sip:") || target.starts_with("sips:") {
+fn normalize_sip_uri(target: &str, domain: &str, scheme: &str) -> String {
+    if let Some(rest) = target.strip_prefix("sip:") {
+        format!("{scheme}:{rest}")
+    } else if target.starts_with("sips:") {
         target.to_string()
     } else {
-        format!("sip:{}@{}", target, domain)
+        format!("{scheme}:{}@{}", target, domain)
     }
 }
 
@@ -78,6 +80,20 @@ impl std::fmt::Debug for SipDialogUAC {
 }
 
 impl SipDialogUAC {
+    pub(crate) fn has_insecure_contact(&self) -> bool {
+        self.invite.request_uri.starts_with("sips:")
+            && !self.remote_target.is_empty()
+            && !self.remote_target.starts_with("sips:")
+    }
+
+    pub(crate) fn has_insecure_route(&self) -> bool {
+        self.invite.request_uri.starts_with("sips:")
+            && self
+                .route_set
+                .iter()
+                .any(|route| !extract_uri(route).starts_with("sips:"))
+    }
+
     /// Creates a UAC dialog from the sent INVITE and the 200 OK response.
     pub fn new(client: Arc<Client>, invite: Message, response: Message) -> Self {
         let call_id = invite.header("Call-ID").to_string();
@@ -110,7 +126,7 @@ impl SipDialogUAC {
 
     fn build_request(&self, method: &str) -> Message {
         let cseq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
-        let target = if self.remote_target.is_empty() {
+        let target = if self.remote_target.is_empty() || self.has_insecure_contact() {
             self.invite.request_uri.clone()
         } else {
             self.remote_target.clone()
@@ -131,7 +147,8 @@ impl SipDialogUAC {
         req.set_header(
             "Contact",
             &format!(
-                "<sip:{}@{}>",
+                "<{}:{}@{}>",
+                self.client.uri_scheme(),
                 self.client.username(),
                 self.client.local_addr()
             ),
@@ -139,7 +156,11 @@ impl SipDialogUAC {
         req.set_header("Max-Forwards", "70");
         req.set_header("User-Agent", self.client.user_agent());
         for route in &self.route_set {
-            req.add_header("Route", route);
+            if !(self.invite.request_uri.starts_with("sips:")
+                && !extract_uri(route).starts_with("sips:"))
+            {
+                req.add_header("Route", route);
+            }
         }
         req
     }
@@ -175,7 +196,10 @@ impl Dialog for SipDialogUAC {
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
-        let refer_to = normalize_sip_uri(target, self.client.domain());
+        if target.starts_with("sips:") && self.client.uri_scheme() != "sips" {
+            return Err(Error::Other("SIPS target requires TLS transport".into()));
+        }
+        let refer_to = normalize_sip_uri(target, self.client.domain(), self.client.uri_scheme());
         let mut req = self.build_request("REFER");
         req.set_header("Refer-To", &format!("<{refer_to}>"));
         let response = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
@@ -329,7 +353,8 @@ impl SipDialogUAS {
         req.set_header(
             "Contact",
             &format!(
-                "<sip:{}@{}>",
+                "<{}:{}@{}>",
+                self.client.uri_scheme(),
                 self.client.username(),
                 self.client.local_addr()
             ),
@@ -357,7 +382,8 @@ impl Dialog for SipDialogUAS {
         resp.set_header(
             "Contact",
             &format!(
-                "<sip:{}@{}>",
+                "<{}:{}@{}>",
+                self.client.uri_scheme(),
                 self.client.username(),
                 self.client.local_addr()
             ),
@@ -403,7 +429,10 @@ impl Dialog for SipDialogUAS {
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
-        let refer_to = normalize_sip_uri(target, self.client.domain());
+        if target.starts_with("sips:") && self.client.uri_scheme() != "sips" {
+            return Err(Error::Other("SIPS target requires TLS transport".into()));
+        }
+        let refer_to = normalize_sip_uri(target, self.client.domain(), self.client.uri_scheme());
         let mut req = self.build_request("REFER");
         req.set_header("Refer-To", &format!("<{refer_to}>"));
         let response = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;

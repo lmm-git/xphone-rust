@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tracing::{debug, info, trace, warn};
 
 use super::client::{Client, ClientConfig};
-use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
+use super::dialog::{build_sip_response, extract_uri, SipDialogUAC, SipDialogUAS};
 use super::message::Message;
 use crate::config::Config;
 use crate::dialog::Dialog;
@@ -45,6 +45,10 @@ impl std::fmt::Debug for SipUA {
 }
 
 impl SipUA {
+    fn normalize_target(&self, target: &str) -> String {
+        normalize_target(target, self.client.domain(), self.client.uri_scheme())
+    }
+
     /// Creates a new SipUA from a phone Config.
     pub fn new(cfg: &Config) -> Result<Self> {
         if cfg.host.is_empty() {
@@ -132,6 +136,19 @@ impl SipUA {
     }
 }
 
+fn normalize_target(target: &str, domain: &str, scheme: &str) -> String {
+    if target.starts_with("sips:") {
+        return target.to_string();
+    }
+    if let Some(rest) = target.strip_prefix("sip:") {
+        return format!("{scheme}:{rest}");
+    }
+    if target.contains('@') {
+        return format!("{scheme}:{target}");
+    }
+    format!("{scheme}:{target}@{domain}")
+}
+
 fn handle_incoming_request(
     inner: &Arc<Mutex<Inner>>,
     client: &Arc<Client>,
@@ -166,6 +183,14 @@ fn handle_invite(
     msg: &Message,
     from_addr: SocketAddr,
 ) {
+    if client.uri_scheme() == "sips"
+        && (!msg.request_uri.starts_with("sips:")
+            || !extract_uri(msg.header("Contact")).starts_with("sips:"))
+    {
+        let resp = build_sip_response(msg, 488, "Not Acceptable Here");
+        let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+        return;
+    }
     let from = msg.header("From").to_string();
     let to = msg.header("To").to_string();
     let remote_sdp = String::from_utf8_lossy(&msg.body).to_string();
@@ -452,11 +477,7 @@ impl SipTransport for SipUA {
         opts: &crate::config::DialOptions,
     ) -> Result<crate::transport::DialResult> {
         // Normalize target to SIP URI.
-        let target_uri = if target.starts_with("sip:") {
-            target.to_string()
-        } else {
-            format!("sip:{}@{}", target, self.client.domain())
-        };
+        let target_uri = self.normalize_target(target);
 
         info!(target = %target_uri, "SIP >>> dialing");
 
@@ -472,7 +493,12 @@ impl SipTransport for SipUA {
                     format!("<{cid}>")
                 }
             } else {
-                format!("<sip:{}@{}>", cid, self.client.domain())
+                format!(
+                    "<{}:{}@{}>",
+                    self.client.uri_scheme(),
+                    cid,
+                    self.client.domain()
+                )
             };
             extra.insert("P-Asserted-Identity".to_string(), pai);
         }
@@ -502,6 +528,15 @@ impl SipTransport for SipUA {
             result.invite,
             result.response,
         ));
+
+        if self.client.uri_scheme() == "sips"
+            && (dlg.has_insecure_contact() || dlg.has_insecure_route())
+        {
+            let _ = dlg.send_bye();
+            return Err(Error::Other(
+                "SIPS response contains an insecure Contact or Route URI".into(),
+            ));
+        }
 
         // A final 2xx may cross CANCEL on the wire. The client has
         // acknowledged it; end the established dialog immediately.
@@ -546,7 +581,8 @@ impl SipTransport for SipUA {
         headers: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Message> {
-        let (code, reason) = self.client.send_subscribe(uri, headers, timeout)?;
+        let uri = self.normalize_target(uri);
+        let (code, reason) = self.client.send_subscribe(&uri, headers, timeout)?;
         let msg = Message::new_response(code, &reason);
         Ok(msg)
     }
@@ -563,11 +599,7 @@ impl SipTransport for SipUA {
         timeout: Duration,
     ) -> Result<()> {
         // Normalize target to SIP URI.
-        let target_uri = if target.starts_with("sip:") {
-            target.to_string()
-        } else {
-            format!("sip:{}@{}", target, self.client.domain())
-        };
+        let target_uri = self.normalize_target(target);
 
         let (code, reason) = self
             .client
@@ -622,6 +654,30 @@ fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sips_targets_keep_secure_scheme() {
+        assert_eq!(
+            normalize_target("1002", "pbx.local", "sips"),
+            "sips:1002@pbx.local"
+        );
+        assert_eq!(
+            normalize_target("sip:1002@pbx.local", "pbx.local", "sips"),
+            "sips:1002@pbx.local"
+        );
+        assert_eq!(
+            normalize_target("sips:1002@pbx.local", "pbx.local", "sips"),
+            "sips:1002@pbx.local"
+        );
+        assert_eq!(
+            normalize_target("1002@other.local", "pbx.local", "sips"),
+            "sips:1002@other.local"
+        );
+        assert_eq!(
+            normalize_target("sips:1002@pbx.local", "pbx.local", "sip"),
+            "sips:1002@pbx.local"
+        );
+    }
 
     #[test]
     fn new_requires_host() {

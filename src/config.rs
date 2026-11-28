@@ -91,7 +91,10 @@ pub struct Config {
     pub pcm_frame_size: usize,
     /// PCM sample rate in Hz (default `8000`).
     pub pcm_rate: u32,
-    /// Enable SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80).
+    /// Require SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80) for calls.
+    /// Calls without a supported audio key are rejected. Active video streams
+    /// require separate usable video keying; unsupported incoming video is
+    /// rejected in the SDP answer while audio may continue.
     pub srtp: bool,
     /// STUN server address (e.g. `"stun.l.google.com:19302"`).
     /// When set, a STUN Binding Request is used to discover the
